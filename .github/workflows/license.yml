@@ -1,0 +1,12 @@
+name: license
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  license-header:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: apache/skywalking-eyes/header@main

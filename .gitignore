@@ -1,0 +1,20 @@
+# Go build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local state
+*.log
+.env

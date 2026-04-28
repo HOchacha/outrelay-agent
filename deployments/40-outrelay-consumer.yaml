@@ -1,0 +1,90 @@
+# Consumer agent: dials svc-echo through the relay. A tiny shell loop
+# pushes a TCP payload at the agent's localhost listener every few
+# seconds and echoes the response into the Pod log. Pair with
+# 30-outrelay-provider.yaml to validate raw TCP echo through the
+# relay splice end-to-end.
+#
+# Identity: outrelay://acme/agent/00000000-0000-0000-0000-000000000002
+# (matches outrelay-agent-consumer-tls from tools/dev-pki in the
+# OutRelay controller repo).
+#
+# This is a runnable consumer; sidecar-example.yaml is the annotated
+# reference for app authors writing their own sidecars.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outrelay-agent-consumer
+  namespace: outrelay-dev
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/component: agent-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: outrelay
+      app.kubernetes.io/component: agent-consumer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: outrelay
+        app.kubernetes.io/managed-by: outrelay-dev
+        app.kubernetes.io/component: agent-consumer
+    spec:
+      containers:
+        # Test client: holds a single long-lived TCP connection open
+        # to the agent's explicit listener, writing a heartbeat every
+        # 0.5 s and echoing the response into the Pod log. The single
+        # stream lets `kubectl delete pod outrelay-relay-X` exercise
+        # §3.18 stream resume — a transparent reconnect should let
+        # the same nc keep streaming bytes after a brief stall.
+        - name: app
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                ( while true; do
+                    printf 'beat %s\n' "$(date -u +%H:%M:%S)"
+                    sleep 0.5
+                  done ) | nc 127.0.0.1 30001
+                echo "[client] stream broken, retrying in 1s"
+                sleep 1
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+        - name: outrelay-agent
+          image: outrelay-agent:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --relay=outrelay-relay.outrelay-dev.svc.cluster.local:7443
+            - --cert=/etc/outrelay/tls.crt
+            - --key=/etc/outrelay/tls.key
+            - --ca=/etc/outrelay/ca.crt
+            - --uri=outrelay://acme/agent/00000000-0000-0000-0000-000000000002
+            - --intercept=explicit
+            - --consume=svc-echo@127.0.0.1:30001
+            - --log-format=json
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/outrelay
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: outrelay-agent-consumer-tls

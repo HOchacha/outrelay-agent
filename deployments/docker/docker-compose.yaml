@@ -1,0 +1,42 @@
+# Example: outrelay-agent as a Docker container on a VM, alongside a
+# consumer application. Uses explicit dial mode and runs without any
+# Kubernetes control plane — the agent only needs outbound network
+# access to a relay.
+#
+# Run on a host with Docker installed:
+#   docker compose -f deployments/docker/docker-compose.yaml up
+#
+# Replace ./identity with the agent cert/key/CA and update the --uri
+# flag below to match the cert's URI SAN.
+
+services:
+  app:
+    image: alpine:3
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          wget -qO- http://127.0.0.1:30001/charge || true
+          sleep 5
+        done
+    network_mode: "service:outrelay-agent"
+    depends_on:
+      - outrelay-agent
+
+  outrelay-agent:
+    image: outrelay-agent:dev
+    command:
+      - --relay=relay.example.internal:7443
+      - --cert=/etc/outrelay/agent.crt
+      - --key=/etc/outrelay/agent.key
+      - --ca=/etc/outrelay/ca.crt
+      - --uri=outrelay://acme/agent/00000000-0000-0000-0000-000000000002
+      - --intercept=explicit
+      - --consume=svc-payments@127.0.0.1:30001
+      - --log-format=json
+    volumes:
+      - ./identity:/etc/outrelay:ro
+    ports:
+      - "127.0.0.1:30001:30001"
+    restart: unless-stopped

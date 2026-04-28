@@ -1,0 +1,33 @@
+# golangci-lint v2 config. Rules tuned to our codebase:
+#   - errcheck: ignore Close()-style cleanup and stdout-style writes
+#     where checking the error provides no actionable signal.
+#   - test files: relax errcheck (defer Close inside tests is the norm).
+# Real bugs (ineffassign, govet, staticcheck rule violations, unused
+# code) keep their default severity.
+version: "2"
+
+linters:
+  default: standard
+
+  settings:
+    errcheck:
+      # Closer + log-style writes are best-effort by convention.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*net.TCPConn).CloseWrite
+        - (*os.File).Close
+        - (*google.golang.org/grpc.ClientConn).Close
+        - (*database/sql.Rows).Close
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+
+  exclusions:
+    rules:
+      # Tests open and close lots of resources for setup/teardown;
+      # a missed Close error has no production consequence.
+      - path: _test\.go
+        linters:
+          - errcheck

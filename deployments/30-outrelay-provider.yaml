@@ -1,0 +1,73 @@
+# Provider agent: registers svc-echo and bridges incoming streams to
+# a colocated TCP echo backend. The echo container runs socat as a
+# trivial cat-loop so raw bytes flow back through the relay's splice.
+#
+# Identity: outrelay://acme/agent/00000000-0000-0000-0000-000000000001
+# (fixed by tools/dev-pki in the OutRelay controller repo so the URI
+# SAN in outrelay-agent-provider-tls matches the --uri flag without
+# templating).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outrelay-agent-provider
+  namespace: outrelay-dev
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/component: agent-provider
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: outrelay
+      app.kubernetes.io/component: agent-provider
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: outrelay
+        app.kubernetes.io/managed-by: outrelay-dev
+        app.kubernetes.io/component: agent-provider
+    spec:
+      containers:
+        # TCP echo backend — bytes the relay splices in flow back out.
+        - name: echo
+          image: alpine/socat:1.8.0.0
+          args:
+            - "-d"
+            - "TCP-LISTEN:8080,reuseaddr,fork"
+            - "EXEC:cat"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+        - name: outrelay-agent
+          image: outrelay-agent:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --relay=outrelay-relay.outrelay-dev.svc.cluster.local:7443
+            - --cert=/etc/outrelay/tls.crt
+            - --key=/etc/outrelay/tls.key
+            - --ca=/etc/outrelay/ca.crt
+            - --uri=outrelay://acme/agent/00000000-0000-0000-0000-000000000001
+            - --expose-service=svc-echo
+            - --expose-target=127.0.0.1:8080
+            - --log-format=json
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/outrelay
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: tls
+          secret:
+            secretName: outrelay-agent-provider-tls

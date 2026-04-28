@@ -1,0 +1,136 @@
+# Reference example — annotated sidecar manifest for app authors who
+# need to wire outrelay-agent into an existing application Pod. Not
+# meant to be applied as-is; use 40-outrelay-consumer.yaml for a
+# runnable consumer.
+#
+# The Secret block below is a placeholder showing the expected shape.
+# For a real deployment, run `make dev-pki` from the OutRelay
+# controller repo and apply `.dev-pki/secrets.yaml` instead — that
+# creates outrelay-agent-{provider,consumer}-tls with the right URI
+# SAN.
+#
+# This manifest shows explicit dial mode (no init container, no
+# CAP_NET_ADMIN). A tproxy variant follows further down as a comment.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: outrelay-agent-identity-EXAMPLE
+  namespace: outrelay-dev
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay-dev
+type: Opaque
+stringData:
+  # Placeholder — see header comment. Real Secret keys are
+  # tls.crt / tls.key / ca.crt (matching the volumeMount layout below).
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    ...replace with leaf cert...
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    ...replace with leaf private key...
+    -----END PRIVATE KEY-----
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    ...replace with CA cert...
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: outrelay-demo-consumer
+  namespace: outrelay-dev
+  labels:
+    app.kubernetes.io/part-of: outrelay
+    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/component: demo-consumer
+spec:
+  restartPolicy: Always
+  containers:
+    # The application speaks only to 127.0.0.1:30001, which is the
+    # explicit-mode listener exposed by the sidecar for svc-payments.
+    - name: app
+      image: alpine:3
+      command:
+        - sh
+        - -c
+        - |
+          while true; do
+            wget -qO- http://127.0.0.1:30001/charge || true
+            sleep 5
+          done
+
+    - name: outrelay-agent
+      image: outrelay-agent:dev
+      args:
+        - --relay=outrelay-relay.outrelay-dev.svc.cluster.local:7443
+        - --cert=/etc/outrelay/tls.crt
+        - --key=/etc/outrelay/tls.key
+        - --ca=/etc/outrelay/ca.crt
+        - --uri=$(OUTRELAY_AGENT_URI)
+        - --intercept=explicit
+        - --consume=svc-payments@127.0.0.1:30001
+        - --log-format=json
+      env:
+        - name: OUTRELAY_AGENT_URI
+          # The cert's URI SAN must match this value. tools/dev-pki
+          # bakes ...001 (provider) and ...002 (consumer) for local
+          # validation; production wires it to a per-Pod identity.
+          value: "outrelay://acme/agent/00000000-0000-0000-0000-000000000002"
+      volumeMounts:
+        - name: identity
+          mountPath: /etc/outrelay
+          readOnly: true
+      resources:
+        requests:
+          cpu: 50m
+          memory: 32Mi
+        limits:
+          cpu: 200m
+          memory: 64Mi
+  volumes:
+    - name: identity
+      secret:
+        # Real deployments: outrelay-agent-{provider,consumer}-tls
+        # from the dev-pki bootstrap (or your own enrollment flow).
+        secretName: outrelay-agent-identity-EXAMPLE
+# ---
+# tproxy variant (linux-only). Requires:
+#   - an init container that adds the iptables REDIRECT rule
+#   - CAP_NET_ADMIN on the init container
+#   - dnsConfig pointing /etc/resolv.conf at the agent's DNS
+#
+# Replace `containers[]` and add init plus dnsConfig:
+#
+#  initContainers:
+#    - name: outrelay-iptables-init
+#      image: outrelay-agent:dev
+#      command:
+#        - sh
+#        - -c
+#        - |
+#          iptables -t nat -A OUTPUT \
+#            -p tcp -d 100.64.0.0/10 \
+#            -j REDIRECT --to-port 15001
+#      securityContext:
+#        capabilities:
+#          add: ["NET_ADMIN"]
+#  dnsPolicy: "None"
+#  dnsConfig:
+#    nameservers: ["127.0.0.1"]
+#    searches: ["outrelay"]
+#  containers:
+#    - name: outrelay-agent
+#      image: outrelay-agent:dev
+#      args:
+#        - --intercept=tproxy
+#        - --tproxy-listen=127.0.0.1:15001
+#        - --dns-listen=127.0.0.1:53
+#        - --dns-suffix=outrelay
+#        - --consume=svc-payments
+#        - ...
+#      securityContext:
+#        capabilities:
+#          add: ["NET_BIND_SERVICE", "NET_ADMIN"]
