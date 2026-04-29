@@ -11,10 +11,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: outrelay-agent-provider
-  namespace: outrelay-dev
+  namespace: outrelay
   labels:
     app.kubernetes.io/part-of: outrelay
-    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/managed-by: outrelay
     app.kubernetes.io/component: agent-provider
 spec:
   replicas: 1
@@ -26,7 +26,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/part-of: outrelay
-        app.kubernetes.io/managed-by: outrelay-dev
+        app.kubernetes.io/managed-by: outrelay
         app.kubernetes.io/component: agent-provider
     spec:
       containers:
@@ -45,10 +45,10 @@ spec:
               cpu: 100m
               memory: 64Mi
         - name: outrelay-agent
-          image: outrelay-agent:dev
-          imagePullPolicy: IfNotPresent
+          image: docker.io/library/outrelay-agent:dev
+          imagePullPolicy: Never
           args:
-            - --relay=outrelay-relay.outrelay-dev.svc.cluster.local:7443
+            - --relay=outrelay-relay.outrelay.svc.cluster.local:7443
             - --cert=/etc/outrelay/tls.crt
             - --key=/etc/outrelay/tls.key
             - --ca=/etc/outrelay/ca.crt

@@ -93,9 +93,9 @@ func TestEngineCheckPicksReachablePair(t *testing.T) {
 	}
 }
 
-// TestEngineCheckAllFail (degradation case from §3.19.6):
-// no remote candidates work — Engine returns ErrNoPair and the
-// caller falls back to keeping the stream on the relay.
+// TestEngineCheckAllFail covers the degradation case: no remote
+// candidate works — Engine returns ErrNoPair and the caller falls
+// back to keeping the stream on the relay.
 func TestEngineCheckAllFail(t *testing.T) {
 	t.Parallel()
 	ca, _ := pki.NewCA()

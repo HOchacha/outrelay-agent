@@ -18,7 +18,7 @@ through the code.
   internal cleanups) can go straight to a PR.
 - **Stay inside the agent's responsibilities.** This repository is
   the per-workload agent: relay session management, local traffic
-  interception, and §3.19 P2P promotion. The wire protocol, the relay
+  interception, and P2P promotion. The wire protocol, the relay
   itself, and the controller live in
   [`boanlab/OutRelay`](https://github.com/boanlab/OutRelay) — protocol
   changes belong there, with the agent following.
@@ -120,11 +120,10 @@ The agent's comment policy is intentionally restrained:
 
 - Document **why**, not **what**. Names should already explain the
   what; comments are for hidden invariants, surprising trade-offs,
-  and pointers to the design-doc section that motivates the code.
-- Reference the design doc with `§<section>` (for example,
-  `§3.18.4 step T5`) when the code is implementing a specific
-  protocol step. The full design lives in
-  [`OutRelay/docs/design.md`](https://github.com/boanlab/OutRelay/blob/main/docs/design.md).
+  and constraints that aren't visible from the surrounding code.
+- The comment must stand on its own: it should make sense to a
+  reader who has only the source tree in front of them. Don't refer
+  out to docs that live outside the repo.
 - Keep package-level docs in the file that defines the package's
   primary type. One paragraph is usually enough.
 - No history, no devlog, no `// TODO(name)` ownership tags. If a

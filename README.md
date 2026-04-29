@@ -27,7 +27,7 @@ pkg/
                       # RunWithReconnect orchestrator, ResumableStream
                       # wrapper that parks on SwapInner during transport
                       # errors so the bridge survives a relay restart,
-                      # plus Promote / MigrateToDirect for §3.19 P2P
+                      # plus Promote / MigrateToDirect for P2P
                       # promotion.
   intercept/          # Local traffic capture.
                       #   explicit.go      — one localhost listener per
@@ -38,21 +38,24 @@ pkg/
                       #                      CGNAT VIPs
                       #   vip.go           — VIP allocator over
                       #                      100.64.0.0/10
-  candidate/          # §3.19 candidate gathering — host (local
+  candidate/          # P2P candidate gathering — host (local
                       # interfaces) + srflx (OBSERVED_ADDR_QUERY against
                       # the relay's built-in STUN-lite).
-  p2p/                # §3.19 promotion engine: Engine (connectivity
+  p2p/                # P2P promotion engine: Engine (connectivity
                       # check), Promoter (OFFER/ANSWER →
                       # MIGRATE_TO_P2P), Demoter (path-loss / peer-close
                       # → MIGRATE_TO_RELAY).
+  forward/            # Agent side of the relay's mini-TURN UDP
+                      # forwarder (relay_mode=forward). A net.PacketConn
+                      # that prefixes every WriteTo with the peer's
+                      # 4-byte allocation id and ships to the relay's
+                      # forwarding endpoint, so quic.Transport can run
+                      # an end-to-end QUIC handshake on top.
 deployments/          # Pod sidecar manifests, provider/consumer
                       # Deployments, plus a docker/ subdir with a
                       # `network_mode: service:outrelay-agent` compose
                       # example for VMs.
 ```
-
-§-numbered references point at sections in
-[`OutRelay/docs/design.md`](https://github.com/boanlab/OutRelay/blob/main/docs/design.md).
 
 ## Build
 

@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 BoanLab @ Dankook University
 
-// Package p2p drives §3.19 connectivity checks against a candidate
-// pair matrix. §3.19.4 — given local + peer candidates,
-// attempt direct QUIC dial in priority order and return the first
-// pair whose handshake completes within a per-pair timeout. The
-// returned transport.Conn is the established direct connection;
-// the caller (Stream Migrator, §3.19.5) drives MIGRATE_TO_P2P
-// and swaps the in-flight ResumableStream's inner over to it.
+// Package p2p drives the connectivity check that decides whether a
+// stream can be promoted off the relay. Given local + peer candidate
+// sets, attempt a direct QUIC dial in priority order and return the
+// first pair whose handshake completes within a per-pair timeout.
+// The returned transport.Conn is the established direct connection;
+// the caller (Session.MigrateToDirect) drives MIGRATE_TO_P2P and
+// swaps the in-flight ResumableStream's inner over to it.
 package p2p
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/boanlab/OutRelay/lib/transport"
@@ -42,6 +43,7 @@ type CheckResult struct {
 type Engine struct {
 	tlsConf *tls.Config
 	perPair time.Duration
+	logger  *slog.Logger
 }
 
 // NewEngine returns an engine that uses tlsConf for outgoing direct
@@ -53,12 +55,20 @@ func NewEngine(tlsConf *tls.Config) *Engine {
 	return &Engine{tlsConf: tlsConf, perPair: DefaultPerPairTimeout}
 }
 
-// SetPerPairTimeout overrides the default 500ms budget. Use for tests.
+// SetPerPairTimeout overrides the default 500ms budget. Use for tests
+// and for cross-cloud topologies where the 1.5-RTT QUIC handshake
+// needs more headroom than intra-region links.
 func (e *Engine) SetPerPairTimeout(d time.Duration) {
 	if d > 0 {
 		e.perPair = d
 	}
 }
+
+// SetLogger wires a slog handler so per-candidate dial failures
+// surface in the agent's structured logs. Without this, an
+// ErrNoPair return is opaque — every connectivity-check failure is
+// silent. Optional; nil disables.
+func (e *Engine) SetLogger(l *slog.Logger) { e.logger = l }
 
 // Check iterates remote candidates (sorted by descending priority)
 // and dials each. Returns the first pair whose QUIC handshake
@@ -81,6 +91,11 @@ func (e *Engine) Check(ctx context.Context, locals, remotes []candidate.Candidat
 		conn, err := transport.DialQUIC(dialCtx, r.Addr.String(), e.tlsConf, nil)
 		cancel()
 		if err != nil {
+			if e.logger != nil {
+				e.logger.Info("p2p: candidate dial failed",
+					"kind", r.Kind, "addr", r.Addr.String(),
+					"elapsed_ms", time.Since(start).Milliseconds(), "err", err)
+			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}

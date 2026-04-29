@@ -16,10 +16,10 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: outrelay-agent-identity-EXAMPLE
-  namespace: outrelay-dev
+  namespace: outrelay
   labels:
     app.kubernetes.io/part-of: outrelay
-    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/managed-by: outrelay
 type: Opaque
 stringData:
   # Placeholder — see header comment. Real Secret keys are
@@ -41,10 +41,10 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: outrelay-demo-consumer
-  namespace: outrelay-dev
+  namespace: outrelay
   labels:
     app.kubernetes.io/part-of: outrelay
-    app.kubernetes.io/managed-by: outrelay-dev
+    app.kubernetes.io/managed-by: outrelay
     app.kubernetes.io/component: demo-consumer
 spec:
   restartPolicy: Always
@@ -65,7 +65,7 @@ spec:
     - name: outrelay-agent
       image: outrelay-agent:dev
       args:
-        - --relay=outrelay-relay.outrelay-dev.svc.cluster.local:7443
+        - --relay=outrelay-relay.outrelay.svc.cluster.local:7443
         - --cert=/etc/outrelay/tls.crt
         - --key=/etc/outrelay/tls.key
         - --ca=/etc/outrelay/ca.crt

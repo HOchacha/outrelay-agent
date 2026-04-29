@@ -9,10 +9,12 @@ view; read this when you need to know which file to open.
 ```
 cmd/outrelay-agent/   # main binary: flag parsing, wiring, lifecycle
 pkg/
-  session/            # mTLS QUIC session to the relay + stream resume
+  session/            # mTLS QUIC session to the relay + stream resume +
+                      # forward-mode bring-up (DialForward / AcceptForward)
   intercept/          # local traffic capture (explicit + tproxy + DNS + VIP)
   candidate/          # P2P candidate gathering (host + server-reflexive)
   p2p/                # P2P promotion engine + demoter
+  forward/            # PacketConn over the relay's mini-TURN UDP plane
 deployments/          # k8s manifests, sidecar example, docker compose
 .github/workflows/    # CI: gofmt, golangci-lint, gosec, test, build-image
 ```
@@ -55,11 +57,13 @@ of it.
 | `Dial` / `DialAny` | HELLO handshake against one or many relay endpoints. `DialAny` returns the first endpoint that completes HELLO. |
 | `Expose` | Sends `REGISTER` and binds an `IncomingHandler` for the named service. |
 | `Dial` (method) | Opens a stream toward a remote service via `OPEN_STREAM`. Returns a `ResumableStream`. |
-| `ResumableStream` | Wraps a `transport.Stream` with the §3.18 byte counters and ring buffer. `Read` / `Write` park on `SwapInner` while a reconnect is in flight, so applications see a brief stall instead of a stream error. |
+| `ResumableStream` | Wraps a `transport.Stream` with the stream-resume byte counters and ring buffer. `Read` / `Write` park on `SwapInner` while a reconnect is in flight, so applications see a brief stall instead of a stream error. |
 | `Run` | Blocks accepting incoming streams and dispatching `INCOMING_STREAM` frames to the registered handler. |
 | `RunWithReconnect` | Wraps `Run` in a loop that re-dials and replays `REGISTER` + `STREAM_RESUME` after every conn loss, with exponential backoff capped at 30 s. |
 | `StartResume` (`checkpoints.go`) | Background goroutines that emit periodic `STREAM_CHECKPOINT` frames and apply inbound ones to the per-stream resume state. |
-| `EnableP2P` / `Promote` / `MigrateToDirect` (`promote.go`) | §3.19 promotion: gather candidates, exchange OFFER/ANSWER, run connectivity check, swap the stream's inner transport over to the direct conn. |
+| `EnableP2P` / `Promote` / `MigrateToDirect` (`promote.go`) | P2P promotion: gather candidates, exchange OFFER/ANSWER, run connectivity check, swap the stream's inner transport over to the direct conn. |
+| `WaitForStreamMode` (`promote.go`) | After Dial / STREAM_ACCEPT, blocks for the relay's per-stream signal (`STREAM_READY` for splice, `ALLOC_GRANTED` for forward). Both modes share the controlReader. |
+| `DialForward` / `AcceptForward` (`forward.go`) | Forward-mode bring-up: open a UDP socket to the relay's mini-TURN endpoint, run `quic.Transport` over it, and complete an end-to-end QUIC handshake with the peer agent. |
 
 The control-stream reader (`controlReader` in `promote.go`) is the
 single dispatcher for inbound control frames: it routes
@@ -83,7 +87,7 @@ Turns local application traffic into target service names.
 
 ### `pkg/candidate`
 
-Builds the agent's reachable-address list for §3.19 P2P promotion.
+Builds the agent's reachable-address list for P2P promotion.
 
 - `HostCandidates(port)` — every non-loopback / non-link-local IP on
   a local interface, paired with the agent's negotiated session
@@ -97,7 +101,7 @@ Builds the agent's reachable-address list for §3.19 P2P promotion.
 
 ### `pkg/p2p`
 
-Drives §3.19 promotion and demotion against a candidate-pair matrix.
+Drives P2P promotion and demotion against a candidate-pair matrix.
 
 - `Engine.Check` — iterates remote candidates in priority order and
   attempts a direct QUIC dial against each, capped by a per-pair
@@ -112,6 +116,27 @@ Drives §3.19 promotion and demotion against a candidate-pair matrix.
   `AcceptStream`. When the peer's QUIC layer signals an error (peer
   close, idle timeout), `OnDegrade` is called once with a
   `DemoteReason` and the caller drives `MIGRATE_TO_RELAY`.
+
+### `pkg/forward`
+
+Agent-side adapter for the relay's mini-TURN UDP forwarding plane
+(`relay_mode=forward`).
+
+- `Dial(relay, myAlloc, peerAlloc)` — binds a fresh UDP socket,
+  sends a registration packet (`peer_alloc=0` followed by
+  `my_alloc`), and returns a `*forward.Conn`.
+- `forward.Conn` satisfies `net.PacketConn`. Every `WriteTo`
+  prepends the peer's 4-byte big-endian allocation id and ships to
+  the relay's forwarding endpoint regardless of the address quic-go
+  passes in. `ReadFrom` returns the relay's address as the "remote"
+  so quic-go's connection map sees a stable peer per connection.
+- `forward.PeerSentinel` is the synthetic remote address the
+  consumer passes to `quic.Transport.Dial`; it's discarded by
+  `WriteTo`.
+
+The plane never sees plaintext: agents establish their own
+end-to-end QUIC over the forwarded path, so the relay handles only
+ciphertext on the mini-TURN data plane.
 
 ## Roles: provider, consumer, both
 
@@ -156,7 +181,7 @@ A running agent is described by which combinations of flags are set:
 ## What this repo does *not* do
 
 - It does not implement the relay. The relay terminates QUIC from
-  agents, runs the splice, and operates the §3.19 OFFER/ANSWER
+  agents, runs the splice, and operates the OFFER/ANSWER
   matcher. See [`boanlab/OutRelay`](https://github.com/boanlab/OutRelay).
 - It does not implement the controller (CRDs, service catalog,
   identity issuance). The controller and dev PKI also live in the

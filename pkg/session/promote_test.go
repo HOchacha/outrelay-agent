@@ -32,9 +32,9 @@ import (
 // MigrateToDirect opens a fresh stream on the direct conn and writes
 // STREAM_RESUME, swapping the ResumableStream's inner.
 //
-// This validates the §3.19 OFFER/ANSWER plumbing plus the Stream
-// Migrator (§3.19.5) end-to-end without needing the relay binary or
-// the responder's full session machinery.
+// This validates the OFFER/ANSWER plumbing plus the
+// MigrateToDirect path end-to-end without needing the relay binary
+// or the responder's full session machinery.
 func TestSessionPromoteAndMigrate(t *testing.T) {
 	t.Parallel()
 

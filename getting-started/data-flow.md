@@ -75,11 +75,21 @@ Step by step:
    name and a freshly generated `StreamID`. The returned
    `ResumableStream` wraps the QUIC stream with byte counters and
    a ring buffer.
-4. `bridge(local, resumableStream)` (`cmd/outrelay-agent/main.go:209`)
-   spawns two `io.Copy` goroutines and propagates a half-close on
-   each direction's EOF, so the request/response round-trip
-   completes cleanly even when the local side closes its writer
-   first.
+4. After `OPEN_STREAM`, the relay tells the agent on stream-0 ctrl
+   which data path to use: `STREAM_READY` for splice mode (default)
+   or `ALLOC_GRANTED` for `relay_mode=forward`. `Session.WaitForStreamMode`
+   blocks until that signal arrives.
+   - **splice mode** — `bridge(local, resumableStream)` runs as
+     described above; bytes flow through the relay-mediated stream.
+   - **forward mode** — `session.DialForward` opens a UDP socket to
+     the relay's mini-TURN endpoint (from `ALLOC_GRANTED.forward_endpoint`),
+     wraps it as a `quic.Transport`, dials the peer agent over it,
+     and bridges `bridge(local, fs.Stream())`. The relay-mediated
+     stream stays open as a liveness signal only.
+5. `bridge` (`cmd/outrelay-agent/main.go`) spawns two `io.Copy`
+   goroutines and propagates a half-close on each direction's EOF,
+   so the request/response round-trip completes cleanly even when
+   the local side closes its writer first.
 
 ### tproxy mode
 
@@ -136,12 +146,22 @@ Step by step:
    way the stream is closed.
 4. On success the handler returns a `Backend` (typically the
    `net.Conn` it just dialed). The agent replies `STREAM_ACCEPT`,
-   wraps the relay-side stream so the §3.18 byte counters track
-   matching values on both ends, and bridges the two halves.
+   wraps the relay-side stream so the stream-resume byte counters track
+   matching values on both ends, and waits on stream-0 ctrl for the
+   relay's mode signal (same `WaitForStreamMode` as the consumer
+   path).
+   - **splice mode** — `bridge(wrapped, backend)` is what the
+     diagram above shows; bytes flow over the relay-mediated stream.
+   - **forward mode** — `session.AcceptForward` opens a UDP socket
+     to the relay's mini-TURN endpoint, listens with
+     `quic.Transport`, and accepts the peer's e2e QUIC connection.
+     `bridge(fs.Stream(), backend)` then ferries bytes over that
+     direct path; the relay-mediated stream stays open as a liveness
+     signal.
 
 ## 4. Reconnect and stream resume
 
-This is the agent's most subtle path and the core of §3.18.
+This is the agent's most subtle path and the core of stream resume.
 
 ```
 RunWithReconnect loop:
@@ -219,7 +239,7 @@ Promote(ctx, rs):
 MigrateToDirect(ctx, rs, peerConn):
   - peerConn.OpenStream
   - write STREAM_RESUME on the direct stream
-  - rs.SwapInner(direct stream)         // §3.19.5 step T5
+  - rs.SwapInner(direct stream)         
 ```
 
 `Engine.Check` reuses the same `transport.DialQUIC` the session
@@ -233,22 +253,6 @@ conn for liveness via `AcceptStream`. When the peer closes or
 the QUIC keepalive fires, `OnDegrade` is called once with a
 `DemoteReason` and the caller drives `MIGRATE_TO_RELAY`.
 
-The wire matcher on the relay side (the §3.19 OFFER/ANSWER
-forwarder, the resume matcher, and the LRU that records
-`MIGRATE_TO_P2P` selections) lives in the controller repo.
-
-## Cross-references
-
-The agent's source comments link into the design doc with `§<section>`:
-
-- `§3.18` — stream resume protocol (counters, ring, STREAM_RESUME).
-- `§3.18.4` — reconnect step ordering, including step T5 (SwapInner).
-- `§3.18.6` — collision and edge-case handling.
-- `§3.19` — P2P promotion architecture.
-- `§3.19.4` — connectivity check.
-- `§3.19.5` — Stream Migrator (direct STREAM_RESUME + SwapInner).
-- `§3.19.6` — demotion triggers.
-
-These all resolve to
-[`OutRelay/docs/design.md`](https://github.com/boanlab/OutRelay/blob/main/docs/design.md)
-in the controller repo.
+The wire matcher on the relay side (the OFFER/ANSWER forwarder, the
+resume matcher, and the LRU that records `MIGRATE_TO_P2P`
+selections) lives in the relay repo (`outrelay-relay/pkg/edge`).

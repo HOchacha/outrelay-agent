@@ -14,12 +14,13 @@ import (
 	"github.com/boanlab/outrelay-agent/pkg/candidate"
 )
 
-// Promoter drives one stream through §3.19 W8 — gather
-// candidates, exchange OFFER/ANSWER via the relay, run connectivity
-// check, and on success send MIGRATE_TO_P2P. The orchestration is
-// transport-agnostic: tests inject SendOffer / RecvAnswer / SendMigrate
-// hooks and the production session will wire those to the agent's
-// control stream + a per-stream-id frame router.
+// Promoter drives one stream through the four-step promotion path:
+// gather candidates, exchange OFFER/ANSWER via the relay, run a
+// connectivity check, and on success send MIGRATE_TO_P2P. The
+// orchestration is transport-agnostic: tests inject SendOffer /
+// RecvAnswer / SendMigrate hooks and the production session wires
+// those to the agent's control stream + a per-stream-id frame
+// router.
 type Promoter struct {
 	StreamID uint64
 	Engine   *Engine
@@ -38,7 +39,7 @@ type Promoter struct {
 
 	// SendMigrate is invoked once after the connectivity check
 	// succeeds. Failure to send is non-fatal; the relay's LRU just
-	// misses the metadata. §3.19.5.
+	// misses the metadata.
 	SendMigrate func(*orpv1.MigrateToP2P) error
 }
 

@@ -12,12 +12,11 @@ import (
 )
 
 // DefaultIdleProbe is the period between liveness checks against an
-// in-use P2P conn. §3.19.6 lists three demotion triggers (RTT timeout
-// 3x, loss > 5%, explicit close); explicit close is observed directly
-// via AcceptStream returning an error, and RTT timeout is observed
-// indirectly via QUIC's own keepalive — the conn fails AcceptStream
-// once the peer is unreachable for the negotiated idle window. Loss
-// rate is not tracked.
+// in-use P2P conn. The two demotion triggers we observe directly are
+// explicit close (AcceptStream returns an error) and RTT timeout
+// (QUIC's idle-timeout keepalive surfaces as an AcceptStream error
+// once the peer has been unreachable for the negotiated window).
+// Loss rate is not tracked.
 const DefaultIdleProbe = 250 * time.Millisecond
 
 // DemoteReason names what triggered demotion.
@@ -42,8 +41,8 @@ var ErrDemoterMisconfigured = errors.New("p2p: Demoter missing required hook")
 // Run blocks until the underlying P2P conn fails or ctx cancels.
 // Liveness is checked by AcceptStream — once the peer drops, the
 // QUIC layer signals an error here. New streams the peer opens are
-// silently closed (the §3.19 P2P channel uses one stream per app
-// stream; we don't expect new ones during normal operation).
+// silently closed (the P2P channel uses one stream per app stream;
+// we don't expect new ones during normal operation).
 func (d *Demoter) Run(ctx context.Context) error {
 	if d.Conn == nil || d.OnDegrade == nil {
 		return ErrDemoterMisconfigured

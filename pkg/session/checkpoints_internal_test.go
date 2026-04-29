@@ -103,6 +103,7 @@ func (r *recordWriter) Write(p []byte) (int, error) {
 func (r *recordWriter) Read(p []byte) (int, error) { return 0, nil }
 func (r *recordWriter) Close() error               { return nil }
 func (r *recordWriter) StreamID() uint64           { return 0 }
+func (r *recordWriter) CancelRead(_ uint64)        {}
 
 func (r *recordWriter) parseFrames(t *testing.T) []*orp.Frame {
 	t.Helper()

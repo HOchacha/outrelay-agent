@@ -10,7 +10,7 @@
 //   - DialAny endpoint failover and RunWithReconnect orchestration,
 //   - ResumableStream wrappers that survive a relay restart by
 //     parking on SwapInner during transport errors, and
-//   - Promote / MigrateToDirect for §3.19 P2P promotion.
+//   - Promote / MigrateToDirect for P2P promotion.
 package session
 
 import (
@@ -69,12 +69,19 @@ type Session struct {
 	// p2p* fields are populated by EnableP2P.
 	p2pMu           sync.Mutex
 	pendingAnswers  map[uint64]chan *orpv1.CandidateAnswer
+	pendingMode     map[uint64]chan streamModeNotice
 	localCandidates []*orpv1.Candidate
+	// p2pEnabled is set true by the first EnableP2P call. It survives
+	// across reconnects so RunWithReconnect knows to restart the
+	// control-stream reader after each successful Reconnect — without
+	// this, the original reader exits when the old ctrl stream errors
+	// at relay restart, and CANDIDATE_ANSWER frames on the new ctrl
+	// stream go unread (P2P promotions then time out forever).
+	p2pEnabled bool
 
-	// ctrlReaderOnce ensures the background control-stream reader is
-	// started at most once, regardless of which entry point (EnableP2P
-	// or StartResume) booted it first. §3.18.3 + §3.19.
-	ctrlReaderOnce sync.Once
+	// p2pCtx is the context passed to EnableP2P. Reconnect uses it to
+	// spawn a fresh controlReader after swapping ctrl.
+	p2pCtx context.Context
 
 	// reconnecting is set by RunWithReconnect between detecting conn
 	// loss and Reconnect completing. ResumableStream.Read/Write check
@@ -84,6 +91,46 @@ type Session struct {
 	// that window, errors propagate immediately (so an OPEN_STREAM
 	// rejection doesn't stall the local conn for ResumeRetryWindow).
 	reconnecting atomic.Bool
+
+	// dialer is the Dialer used by Reconnect (and in principle any
+	// future redial path). Dial / DialAny set it to DefaultDialer;
+	// DialOnTransport sets it to a SharedTransport so the EIM
+	// hole-punching path keeps the same UDP socket across reconnects.
+	dialer transport.Dialer
+
+	// forwardServerTLS, if non-nil, enables provider-side acceptance
+	// of relay_mode=FORWARD streams: when handleIncoming sees an
+	// AllocGranted (instead of StreamReady) on the agent's stream-0
+	// ctrl after STREAM_ACCEPT, it opens a forward.Conn to the
+	// granted endpoint and accepts a peer-initiated e2e QUIC
+	// connection there, bridging that connection's first stream to
+	// the registered backend instead of the relay-mediated stream.
+	// Set via SetForwardServerTLS; nil means forward mode falls back
+	// to the relay-mediated splice path (defensive — the relay only
+	// sends AllocGranted when its own --listen-forward is enabled).
+	forwardServerTLS *tls.Config
+}
+
+// SetForwardServerTLS enables provider-side acceptance of
+// relay_mode=FORWARD streams over the relay's mini-TURN data plane.
+// Pass the same mTLS server config used for P2P direct listening —
+// the cert pool, client-cert requirement, and ALPN override applied
+// internally guarantee both peers (consumer dialer + provider
+// listener) speak the forward-mode ALPN over the e2e QUIC channel.
+//
+// Call before Run / RunWithReconnect so an inbound INCOMING_STREAM
+// landing immediately after relay-side policy says FORWARD doesn't
+// race the assignment.
+func (s *Session) SetForwardServerTLS(c *tls.Config) {
+	s.mu.Lock()
+	s.forwardServerTLS = c
+	s.mu.Unlock()
+}
+
+func (s *Session) forwardTLS() *tls.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.forwardServerTLS
 }
 
 // DialAny tries each address in addrs in order and returns the first
@@ -110,14 +157,94 @@ func DialAny(ctx context.Context, addrs []string, tlsConf *tls.Config, agentURI 
 	return nil, fmt.Errorf("session: all relay endpoints failed: %w", firstErr)
 }
 
+// DialAnyHappy is the "happy eyeballs" variant of DialAny: it dials
+// every address concurrently and returns the first session that
+// completes HELLO. Slower attempts are cancelled. Used to pick the
+// lowest-RTT relay in multi-region deployments without an explicit
+// RTT probe — the fastest dial-to-HELLO round-trip wins by
+// construction. Sessions from losing dials are closed before the
+// function returns so no resources leak.
+//
+// dialer is the same Dialer used inside Session (DefaultDialer for
+// the standard QUIC path, SharedTransport for the P2P socket-reuse
+// path, TCPDialer for the TCP/443 fallback). All N attempts share
+// the dialer.
+func DialAnyHappy(ctx context.Context, dialer transport.Dialer, addrs []string, tlsConf *tls.Config, agentURI string, logger *slog.Logger) (*Session, error) {
+	if len(addrs) == 0 {
+		return nil, errors.New("session: no relay addresses")
+	}
+	if len(addrs) == 1 {
+		return DialWithDialer(ctx, dialer, addrs[0], tlsConf, agentURI, logger)
+	}
+
+	type attempt struct {
+		s    *Session
+		err  error
+		addr string
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan attempt, len(addrs))
+	for _, addr := range addrs {
+		addr := addr
+		go func() {
+			s, err := DialWithDialer(raceCtx, dialer, addr, tlsConf, agentURI, logger)
+			results <- attempt{s: s, err: err, addr: addr}
+		}()
+	}
+
+	var (
+		winner   *Session
+		firstErr error
+	)
+	for i := 0; i < len(addrs); i++ {
+		r := <-results
+		switch {
+		case r.err == nil && winner == nil:
+			winner = r.s
+			cancel() // race over — abort the slower attempts
+			if logger != nil {
+				logger.Info("session: nearest-relay selected", "addr", r.addr)
+			}
+		case r.err == nil && winner != nil:
+			// Already had a winner; this one was just slower or
+			// finished concurrently. Close it.
+			_ = r.s.Close()
+		case r.err != nil:
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			if logger != nil && winner == nil {
+				logger.Warn("session: relay endpoint unhealthy", "addr", r.addr, "err", r.err)
+			}
+		}
+	}
+
+	if winner != nil {
+		return winner, nil
+	}
+	return nil, fmt.Errorf("session: all relay endpoints failed: %w", firstErr)
+}
+
 // Dial connects to the relay at addr, performs HELLO, and returns a
 // ready Session. The caller's tls.Config must contain a client cert
 // whose URI SAN matches agentURI.
 func Dial(ctx context.Context, addr string, tlsConf *tls.Config, agentURI string, logger *slog.Logger) (*Session, error) {
+	return DialWithDialer(ctx, transport.DefaultDialer{}, addr, tlsConf, agentURI, logger)
+}
+
+// DialWithDialer is like Dial but uses the supplied Dialer for the
+// outbound QUIC connection (and stashes it on the Session so
+// Reconnect uses the same transport on relay drops). Pass a
+// *transport.SharedTransport to get EIM hole-punching semantics:
+// the same UDP socket is used for the relay connection and (via
+// the listener built from the same SharedTransport) inbound P2P.
+func DialWithDialer(ctx context.Context, dialer transport.Dialer, addr string, tlsConf *tls.Config, agentURI string, logger *slog.Logger) (*Session, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	conn, err := transport.DialQUIC(ctx, addr, tlsConf, nil)
+	conn, err := dialer.Dial(ctx, addr, tlsConf, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +277,7 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, agentURI string
 		agentURI: agentURI,
 		handlers: map[string]IncomingHandler{},
 		streams:  map[resume.StreamID]*ResumableStream{},
+		dialer:   dialer,
 	}, nil
 }
 
@@ -180,23 +308,45 @@ func (s *Session) Expose(ctx context.Context, name, localAddr string, h Incoming
 }
 
 // Dial opens a stream toward target and writes OPEN_STREAM. The
-// returned stream is wrapped with §3.18 byte-position accounting so
+// returned stream is wrapped with byte-position accounting so
 // retransmission on relay failover stays consistent with the peer's
-// view of how many bytes flowed each way (§3.18.4).
+// view of how many bytes flowed each way (the stream-resume path).
 //
 // If the relay (or provider) rejects the stream, the rejection
 // surfaces as a frame the caller will Read on the same stream.
+//
+// The relay always sends one of {StreamReady, AllocGranted} on the
+// agent's stream-0 ctrl after policy resolution. To avoid a
+// registration race, Dial installs the per-stream mode waiter
+// BEFORE writing OPEN_STREAM. Callers consume the result with
+// WaitForStreamMode(ctx, rs.StreamID()) and branch into forward
+// (AllocGranted non-nil) or splice (nil) bridging.
 func (s *Session) Dial(ctx context.Context, target, method string) (*ResumableStream, error) {
 	st, err := s.conn.OpenStream(ctx)
 	if err != nil {
 		return nil, err
 	}
 	id := s.freshStreamID(target, method)
+	// Install the mode waiter before sending OPEN_STREAM so a fast
+	// relay can't deliver StreamReady / AllocGranted before we are
+	// ready to receive it. Skipped when EnableP2P hasn't been called
+	// — without a controlReader the wait would no-op anyway, and
+	// callers that don't enable P2P / forward-mode want the minimal
+	// splice path with no extra bookkeeping.
+	s.p2pMu.Lock()
+	ena := s.p2pEnabled
+	s.p2pMu.Unlock()
+	if ena {
+		s.RegisterStreamModeWaiter(uint64(id))
+	}
 	if err := orp.WriteFrame(st, orp.FrameTypeOpenStream, &orpv1.OpenStream{
 		TargetService: target,
 		Method:        method,
 		StreamId:      uint64(id),
 	}); err != nil {
+		if ena {
+			s.CancelStreamModeWaiter(uint64(id))
+		}
 		_ = st.Close()
 		return nil, fmt.Errorf("session: send OPEN_STREAM: %w", err)
 	}
@@ -204,10 +354,10 @@ func (s *Session) Dial(ctx context.Context, target, method string) (*ResumableSt
 }
 
 // freshStreamID returns a StreamID that is not currently active in
-// this Session. The id generator's monotonic counter + ns clock makes
-// duplicates astronomically unlikely (§3.18.6 case 4), but the local
-// check costs nothing and prevents a wraparound from silently
-// clobbering an active stream's resume state.
+// this Session. The id generator's monotonic counter + ns clock
+// makes duplicates astronomically unlikely, but the local check
+// costs nothing and prevents a wraparound from silently clobbering
+// an active stream's resume state.
 func (s *Session) freshStreamID(target, method string) resume.StreamID {
 	for {
 		id := resume.NewStreamID(s.agentURI, target, method)
@@ -225,8 +375,8 @@ func (s *Session) freshStreamID(target, method string) resume.StreamID {
 // the consumer side the id comes from freshStreamID so duplicates
 // can't happen; on the provider side the id is given by the peer's
 // INCOMING_STREAM and a duplicate indicates either a peer bug or a
-// §3.18.6 case 4 collision — the prior state is replaced and a warn
-// log is emitted, preferring to keep the new stream functional over
+// rare collision — the prior state is replaced and a warn log is
+// emitted, preferring to keep the new stream functional over
 // preserving stale state.
 func (s *Session) wrapStream(id resume.StreamID, inner transport.Stream) *ResumableStream {
 	state := resume.NewState(id, 0) // 0 -> resume.DefaultRingCapacity
@@ -275,12 +425,12 @@ const ResumeRetryWindow = 30 * time.Second
 // application reconnects at its own layer.
 var ErrStreamLost = errors.New("session: stream lost")
 
-// ResumableStream wraps a transport.Stream with §3.18 byte counters
-// and a ring buffer. Read/Write delegate to the inner stream and bump
+// ResumableStream wraps a transport.Stream with byte counters and a
+// ring buffer. Read/Write delegate to the inner stream and bump
 // counters; State() exposes the per-stream State for tests / metrics.
 //
 // The inner stream is replaceable via SwapInner — that's the
-// mechanism by which a §3.18 reconnect propagates the new stream to
+// mechanism by which a stream-resume propagates the new stream to
 // in-flight readers / writers without the application seeing the
 // transition. When the inner errors, Read / Write block on a per-
 // stream condvar until either SwapInner installs a new transport or
@@ -425,15 +575,28 @@ func (r *ResumableStream) markAbandoned() {
 // SwapInner replaces the underlying stream and wakes any Read / Write
 // calls that parked on a previous inner's error. Called by
 // Session.Resume after a fresh STREAM_RESUME has been matched on the
-// new relay. §3.18.4 step T5.
+// new relay, and by Session.MigrateToDirect / AcceptDirect after a
+// P2P promotion completes.
+//
+// We CancelRead the previous inner so a Read currently parked
+// waiting on it (a bridge expecting more bytes) returns an error,
+// falls into waitForResume, observes resumeReady close, and
+// resumes against the freshly installed inner. For the relay-
+// resume case the previous inner is already broken so CancelRead
+// is a no-op; for P2P migration it is what lets bytes actually
+// start flowing over the direct path mid-stream.
 func (r *ResumableStream) SwapInner(s transport.Stream) {
 	r.mu.Lock()
+	old := r.inner
 	r.inner = s
-	old := r.resumeReady
+	oldReady := r.resumeReady
 	r.resumeReady = make(chan struct{})
 	r.mu.Unlock()
+	if oldReady != nil {
+		close(oldReady)
+	}
 	if old != nil {
-		close(old)
+		old.CancelRead(0)
 	}
 }
 
@@ -458,7 +621,7 @@ func (r *ResumableStream) CloseWrite() error {
 // counters, reads the peer's STREAM_RESUME echo from the relay,
 // retransmits the (peer.peer_ack, my.sent] byte range from the ring
 // buffer, and finally swaps the wrapper's inner to the new stream so
-// readers / writers transparently continue. §3.18.4 step T4–T5.
+// readers / writers transparently continue.
 //
 // The relay's matcher pairs this STREAM_RESUME with the peer's
 // STREAM_RESUME by stream id; once matched, the relay echoes the
@@ -491,7 +654,7 @@ func (s *Session) Resume(ctx context.Context, rs *ResumableStream) error {
 
 // completeResume reads the peer's echoed STREAM_RESUME and retransmits
 // any bytes the peer hasn't yet acknowledged from this side's ring
-// buffer. Shared by Session.Resume and the §3.19 direct migration
+// buffer. Shared by Session.Resume and the P2P direct migration
 // path so retransmit semantics stay identical regardless of who
 // carries the spliced bytes.
 func (s *Session) completeResume(rs *ResumableStream, st transport.Stream) error {
@@ -530,7 +693,7 @@ func (s *Session) SwapConn(conn transport.Conn) {
 // any of addrs, replays REGISTER for every previously exposed
 // service, and replays STREAM_RESUME on every active ResumableStream
 // — the relay's matcher pairs the halves and splice resumes from the
-// peer-ack ring position. §3.18.
+// peer-ack ring position.
 //
 // Streams whose Resume errors (e.g. ErrBeforeRing — peer's ack predates
 // the ring tail) are forgotten; the application sees a Read/Write
@@ -546,8 +709,12 @@ func (s *Session) Reconnect(ctx context.Context, addrs []string, tlsConf *tls.Co
 		ctrl    transport.Stream
 		dialErr error
 	)
+	dialer := s.dialer
+	if dialer == nil {
+		dialer = transport.DefaultDialer{}
+	}
 	for _, addr := range addrs {
-		c, err := transport.DialQUIC(ctx, addr, tlsConf, nil)
+		c, err := dialer.Dial(ctx, addr, tlsConf, nil)
 		if err != nil {
 			if dialErr == nil {
 				dialErr = err
@@ -654,6 +821,11 @@ func (s *Session) RunWithReconnect(ctx context.Context, addrs []string, tlsConf 
 			rerr := s.Reconnect(ctx, addrs, tlsConf)
 			if rerr == nil {
 				s.logger.Info("session: reconnected")
+				// The old controlReader exited when the previous
+				// ctrl stream errored. Restart it on the fresh ctrl
+				// so P2P promotions keep working after a relay
+				// restart.
+				s.restartControlReaderIfEnabled()
 				break
 			}
 			s.logger.Warn("session: reconnect attempt failed", "err", rerr)
@@ -742,7 +914,22 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 		_ = st.Close()
 		return
 	}
+	// Install the mode waiter BEFORE writing STREAM_ACCEPT so the
+	// relay's response (StreamReady or AllocGranted) can never land
+	// on stream-0 before the controlReader has a route for it. Skip
+	// when EnableP2P hasn't been called — without a controlReader
+	// the wait would just block, and splice mode is the right
+	// behaviour for stubs / minimal harnesses.
+	s.p2pMu.Lock()
+	ena := s.p2pEnabled
+	s.p2pMu.Unlock()
+	if ena {
+		s.RegisterStreamModeWaiter(in.StreamId)
+	}
 	if err := orp.WriteFrame(st, orp.FrameTypeStreamAccept, &orpv1.StreamAccept{}); err != nil {
+		if ena {
+			s.CancelStreamModeWaiter(in.StreamId)
+		}
 		_ = backend.Close()
 		_ = st.Close()
 		return
@@ -753,6 +940,36 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 	// flows through INCOMING_STREAM so both ends agree.
 	wrapped := s.wrapStream(resume.StreamID(in.StreamId), st)
 	defer func() { _ = wrapped.Close() }()
+
+	if ena {
+		// 5s ceiling guards against a peer relay that never sends a
+		// mode signal (older binary, mid-failover): falls back to
+		// splice instead of hanging the stream open forever.
+		modeCtx, modeCancel := context.WithTimeout(ctx, 5*time.Second)
+		granted := s.WaitForStreamMode(modeCtx, in.StreamId)
+		modeCancel()
+		if granted != nil {
+			ftls := s.forwardTLS()
+			if ftls == nil {
+				s.logger.Warn("agent: AllocGranted received but forward TLS not configured; falling back to relay-mediated bridge",
+					"stream_id", in.StreamId)
+				bridge(wrapped, backend)
+				return
+			}
+			fs, err := AcceptForward(ctx, granted, ftls)
+			if err != nil {
+				s.logger.Warn("agent: forward accept failed; tearing down stream",
+					"stream_id", in.StreamId, "err", err)
+				_ = backend.Close()
+				return
+			}
+			defer func() { _ = fs.Close() }()
+			// In forward mode the relay-mediated stream is just a
+			// liveness signal. Bytes flow over fs.Stream() ↔ backend.
+			bridge(fs.Stream(), backend)
+			return
+		}
+	}
 	bridge(wrapped, backend)
 }
 

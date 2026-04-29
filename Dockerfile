@@ -3,11 +3,19 @@
 
 FROM golang:1.25-alpine AS build
 
+# git is needed for the direct module fetch driven by GOPRIVATE below.
+RUN apk add --no-cache git
+
 # VERSION is stamped into main.Version of the binary at link time.
 # Override with `docker build --build-arg VERSION=v1.2.3 ...`; the
 # Makefile passes $(TAG) here on `make build-image`.
 ARG VERSION=dev
 ENV VERSION=$VERSION
+
+# boanlab/* modules are fetched directly from GitHub rather than the
+# Go module proxy. The proxy treats published versions as immutable;
+# any in-place tag update needs a direct fetch to surface.
+ENV GOPRIVATE=github.com/boanlab/*
 
 WORKDIR /src
 

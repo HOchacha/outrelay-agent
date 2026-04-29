@@ -2,7 +2,7 @@
 // Copyright 2026 BoanLab @ Dankook University
 
 // Package candidate gathers the agent's possible reachable
-// addresses for §3.19 P2P promotion. Two kinds are produced:
+// addresses for P2P promotion. Two kinds are produced:
 //
 //   - host:  every non-loopback / non-link-local IP on a local
 //     interface, paired with the agent's negotiated session port.
@@ -10,7 +10,7 @@
 //     connection (server-reflexive, RFC 8445 terminology).
 //
 // The agent's session uses these to populate a CandidateOffer that
-// flows to the peer agent through the relay (§3.19.3).
+// flows to the peer agent through the relay.
 package candidate
 
 import (
@@ -44,7 +44,7 @@ func (c Candidate) String() string {
 // HostCandidates returns one Candidate per usable local interface
 // address, paired with port. Loopback (127.0.0.0/8, ::1), link-local,
 // and multicast addresses are dropped — they aren't routable beyond
-// the host. §3.19.3 keeps this list small on purpose.
+// the host. The list is intentionally small.
 func HostCandidates(port uint16) []Candidate {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {

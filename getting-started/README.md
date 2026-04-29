@@ -46,18 +46,28 @@ A single agent instance can simultaneously **provide** services
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--relay` | `127.0.0.1:7443` | Comma-separated relay endpoints. The agent dials the first healthy one and re-dials on conn loss. |
+| `--relay` | `127.0.0.1:7443` | Comma-separated relay endpoints. The agent dials concurrently (happy-eyeballs) and keeps the lowest-RTT one. |
+| `--relay-tcp` | `""` | Comma-separated TCP+TLS+yamux fallback endpoints. The agent fails over to these when the QUIC dial cannot complete. |
 | `--uri` | (required) | Agent URI; must match the cert's URI SAN. |
 | `--cert` / `--key` / `--ca` | (required) | mTLS material. |
 | `--server-name` | `localhost` | TLS `ServerName`. Production should set this to the relay cert's name. |
 | `--intercept` | `explicit` | `explicit` or `tproxy`. |
 | `--consume` | (repeatable) | `<svc>@<bind-addr>` in explicit mode, `<svc>` in tproxy mode. |
 | `--expose-service` / `--expose-target` | — | Register a local backend with the relay. |
+| `--p2p-listen` | `""` | If set (e.g. `0.0.0.0:7445`), stand up a QUIC listener for inbound P2P direct dials on a shared UDP socket. Empty disables the P2P-success path; promotion is still attempted but stays on the relay. |
+| `--p2p-advertise` | `""` | Override the P2P-listen advertised endpoint when srflx is unreliable (e.g. dev tunnels, known-stable EIP). |
 | `--tproxy-listen` | `127.0.0.1:15001` | tproxy proxy port. |
 | `--dns-listen` | `127.0.0.1:5353` | Embedded DNS server bind address (tproxy mode). |
 | `--dns-suffix` | `outrelay` | DNS suffix for service names (tproxy mode). |
 | `--log-format` | `text` | `text` or `json`. |
 | `--version` | — | Print the build version stamped at link time and exit. |
+
+The agent honours the relay's per-stream mode signal (`STREAM_READY`
+for splice, `ALLOC_GRANTED` for the mini-TURN forwarding plane)
+automatically — there is no agent-side flag to enable or disable
+forward mode. When the relay grants forward, the agent opens a UDP
+socket to the relay's `--listen-forward` endpoint and runs the
+end-to-end QUIC handshake against the peer agent over it.
 
 ## Run
 

@@ -12,7 +12,7 @@ import (
 	"github.com/boanlab/OutRelay/lib/resume"
 )
 
-// StartResume boots the §3.18 background loop:
+// StartResume boots the stream-resume background loop:
 // - inbound STREAM_CHECKPOINT frames are dispatched onto per-stream
 // resume.State via OnCheckpointFromPeer (advances PeerAckPos and
 // frees ring-buffer space)
@@ -27,7 +27,10 @@ func (s *Session) StartResume(ctx context.Context, period time.Duration) {
 	if period <= 0 {
 		period = time.Duration(resume.CheckpointPeriodMs) * time.Millisecond
 	}
-	s.ctrlReaderOnce.Do(func() { go s.controlReader(ctx) })
+	// EnableP2P installs the same controlReader; sharing readers
+	// across both entry points is fine — each call is idempotent on
+	// the p2pEnabled flag, so at most one reader is alive at a time.
+	s.EnableP2P(ctx)
 	go s.emitCheckpoints(ctx, period)
 }
 
@@ -67,9 +70,9 @@ func (s *Session) emitOnce() {
 }
 
 // applyCheckpoint is called by controlReader on inbound
-// STREAM_CHECKPOINT. §3.18.3 — we treat the peer's reported
-// peer_ack_position as the upper bound of bytes we may discard from
-// our local ring buffer.
+// STREAM_CHECKPOINT. We treat the peer's reported peer_ack_position
+// as the upper bound of bytes we may discard from our local ring
+// buffer.
 func (s *Session) applyCheckpoint(cp *orpv1.StreamCheckpoint) {
 	s.mu.RLock()
 	rs, ok := s.streams[resume.StreamID(cp.StreamId)]

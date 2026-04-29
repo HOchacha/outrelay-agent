@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
 	"github.com/boanlab/OutRelay/lib/orp"
 	orpv1 "github.com/boanlab/OutRelay/lib/orp/v1"
+	"github.com/boanlab/OutRelay/lib/resume"
 	"github.com/boanlab/OutRelay/lib/transport"
 
 	"github.com/boanlab/outrelay-agent/pkg/candidate"
@@ -19,9 +21,10 @@ import (
 )
 
 // EnableP2P starts the background control-stream reader so Session
-// can dispatch §3.19 frames (CANDIDATE_OFFER / CANDIDATE_ANSWER /
-// MIGRATE_TO_*) to per-stream-id waiters. Call AFTER Expose() but
-// before any Promote() call. Idempotent on repeated calls.
+// can dispatch P2P-promotion frames (CANDIDATE_OFFER /
+// CANDIDATE_ANSWER / MIGRATE_TO_*) to per-stream-id waiters. Call
+// AFTER Expose() but before any Promote() call. Idempotent on
+// repeated calls.
 //
 // ctx scopes the reader's lifetime — passing the same ctx that
 // drives Run() is the typical pattern.
@@ -30,15 +33,39 @@ func (s *Session) EnableP2P(ctx context.Context) {
 	if s.pendingAnswers == nil {
 		s.pendingAnswers = map[uint64]chan *orpv1.CandidateAnswer{}
 	}
+	if s.pendingMode == nil {
+		s.pendingMode = map[uint64]chan streamModeNotice{}
+	}
+	already := s.p2pEnabled
+	s.p2pEnabled = true
+	s.p2pCtx = ctx
 	s.p2pMu.Unlock()
-	s.ctrlReaderOnce.Do(func() { go s.controlReader(ctx) })
+	if !already {
+		go s.controlReader(ctx)
+	}
+}
+
+// restartControlReaderIfEnabled is called from Reconnect after the
+// new ctrl stream is wired in. The old reader has by then exited
+// (its ParseFrame on the closed ctrl errored); without this
+// re-spawn, no goroutine reads from the new ctrl, and inbound
+// P2P-promotion frames sit in the QUIC stream forever.
+func (s *Session) restartControlReaderIfEnabled() {
+	s.p2pMu.Lock()
+	enabled := s.p2pEnabled
+	ctx := s.p2pCtx
+	s.p2pMu.Unlock()
+	if !enabled || ctx == nil {
+		return
+	}
+	go s.controlReader(ctx)
 }
 
 // controlReader reads frames from the agent's control stream forever
 // (until ctx cancels or the stream closes). Routes:
 //   - CANDIDATE_ANSWER  -> pending Promoter waiter (Promote initiator)
 //   - CANDIDATE_OFFER   -> auto-respond with our local candidates
-//     (responder side, §3.19.4)
+//     (responder side)
 //   - STREAM_CHECKPOINT -> per-stream resume.State.OnCheckpointFromPeer
 //   - other             -> drop with warn log
 //
@@ -76,6 +103,18 @@ func (s *Session) controlReader(ctx context.Context) {
 				continue
 			}
 			s.applyCheckpoint(cp)
+		case orp.FrameTypeAllocGranted:
+			g := &orpv1.AllocGranted{}
+			if err := orp.UnmarshalProto(f, orp.FrameTypeAllocGranted, g); err != nil {
+				continue
+			}
+			s.deliverMode(g.StreamId, streamModeNotice{granted: g})
+		case orp.FrameTypeStreamReady:
+			r := &orpv1.StreamReady{}
+			if err := orp.UnmarshalProto(f, orp.FrameTypeStreamReady, r); err != nil {
+				continue
+			}
+			s.deliverMode(r.StreamId, streamModeNotice{}) // splice
 		default:
 			s.logger.Warn("session: unexpected ctrl frame", "type", f.Type)
 		}
@@ -142,6 +181,84 @@ func (s *Session) deliverAnswer(a *orpv1.CandidateAnswer) {
 	}
 }
 
+// streamModeNotice is what the controlReader delivers to a per-stream
+// mode waiter. granted == nil means the relay signalled splice mode
+// (FrameTypeStreamReady); granted != nil means the relay signalled
+// FORWARD mode and supplied the alloc info on the agent's stream-0
+// ctrl.
+type streamModeNotice struct {
+	granted *orpv1.AllocGranted
+}
+
+// RegisterStreamModeWaiter installs a one-shot channel for either
+// StreamReady (splice) or AllocGranted (forward). The caller MUST
+// register before the action that triggers the relay's response —
+// for the consumer side that's BEFORE writing OPEN_STREAM, for the
+// provider side BEFORE writing STREAM_ACCEPT — so the controlReader
+// has a place to deliver the inbound frame.
+//
+// Returned channel is buffer-1 and will receive exactly once. Caller
+// must read from it (with their own context for cancellation) and is
+// responsible for invoking CancelStreamModeWaiter on a context-cancel
+// path so the map entry doesn't leak.
+func (s *Session) RegisterStreamModeWaiter(streamID uint64) chan streamModeNotice {
+	ch := make(chan streamModeNotice, 1)
+	s.p2pMu.Lock()
+	if s.pendingMode == nil {
+		s.pendingMode = map[uint64]chan streamModeNotice{}
+	}
+	s.pendingMode[streamID] = ch
+	s.p2pMu.Unlock()
+	return ch
+}
+
+// CancelStreamModeWaiter removes a registered waiter without
+// delivering. Idempotent.
+func (s *Session) CancelStreamModeWaiter(streamID uint64) {
+	s.p2pMu.Lock()
+	delete(s.pendingMode, streamID)
+	s.p2pMu.Unlock()
+}
+
+func (s *Session) deliverMode(streamID uint64, n streamModeNotice) {
+	s.p2pMu.Lock()
+	ch := s.pendingMode[streamID]
+	s.p2pMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- n:
+		default:
+		}
+	}
+}
+
+// WaitForStreamMode blocks for either AllocGranted (forward) or
+// StreamReady (splice) for streamID. Returns the AllocGranted iff the
+// relay chose FORWARD; nil means splice mode signalled by StreamReady
+// or ctx fired before any signal. The caller must have called
+// RegisterStreamModeWaiter(streamID) before triggering the relay
+// response (writing OPEN_STREAM on the consumer side, STREAM_ACCEPT
+// on the provider side); otherwise this call is racy and may miss
+// the frame.
+//
+// EnableP2P must be active so the controlReader is alive.
+func (s *Session) WaitForStreamMode(ctx context.Context, streamID uint64) *orpv1.AllocGranted {
+	s.p2pMu.Lock()
+	ch, ok := s.pendingMode[streamID]
+	s.p2pMu.Unlock()
+	if !ok {
+		// Caller forgot to register; treat as splice (no-op).
+		return nil
+	}
+	defer s.CancelStreamModeWaiter(streamID)
+	select {
+	case n := <-ch:
+		return n.granted
+	case <-ctx.Done():
+		return nil
+	}
+}
+
 // PromoteOptions parameterises Session.Promote.
 type PromoteOptions struct {
 	// HostPort is the local port whose host candidates we advertise
@@ -157,10 +274,11 @@ type PromoteOptions struct {
 	// DialTLS is the TLS config used to dial peer candidates during
 	// the connectivity check. Must contain the agent's client cert
 	// + the trust pool that validates peer leaf certs.
-	DialTLS interface{} // *tls.Config — kept as any to avoid an import here
+	DialTLS any // *tls.Config — kept as any to avoid an import here
 }
 
-// Promote drives §3.19 promotion for rs against the agent's peer.
+// Promote drives the P2P-promotion handshake for rs against the
+// agent's peer.
 // EnableP2P must be running. The peer agent is expected to be
 // running its own answer/listener side concurrently.
 //
@@ -208,10 +326,113 @@ func (s *Session) Promote(ctx context.Context, rs *ResumableStream, eng *p2p.Eng
 	return pr.Run(ctx)
 }
 
-// MigrateToDirect is the §3.19 Stream Migrator: open a fresh stream
-// on peerConn, write STREAM_RESUME so the peer agent's resume matcher
-// pairs it, and SwapInner the ResumableStream's underlying transport
-// over to the direct path. §3.19.5 step T5.
+// QueryServerReflexive asks the relay to echo the agent's NAT-mapped
+// src ip:port via OBSERVED_ADDR_QUERY / OBSERVED_ADDR_RESP. Returns
+// a Candidate with kind="srflx" — the agent typically pairs the IP
+// with its listener port to form an externally-reachable host
+// candidate.
+//
+// MUST be called BEFORE EnableP2P. The background controlReader
+// installed by EnableP2P consumes every frame on the ctrl stream
+// and would intercept the OBSERVED_ADDR_RESP, never delivering it
+// here. Calling after EnableP2P returns an error rather than racing.
+func (s *Session) QueryServerReflexive(ctx context.Context, timeout time.Duration) (candidate.Candidate, error) {
+	s.p2pMu.Lock()
+	enabled := s.p2pEnabled
+	s.p2pMu.Unlock()
+	if enabled {
+		return candidate.Candidate{}, errors.New("session: QueryServerReflexive must run before EnableP2P")
+	}
+	return candidate.QueryServerReflexive(ctx, s.ctrl, timeout)
+}
+
+// AcceptDirect is the responder-side counterpart to MigrateToDirect.
+// It runs an accept loop on ln, expecting peers to dial in over the
+// host candidates this Session advertises (via SetLocalCandidates).
+// For each new stream, the first frame must be STREAM_RESUME whose
+// stream_id maps to an active *ResumableStream in this Session; on
+// match, the gap from the peer's ack position is retransmitted and
+// the wrapper's inner is swapped over to the direct stream — the
+// bridge() above keeps running, transparently.
+//
+// Streams that don't match a known id are dropped. Returns when ctx
+// is cancelled or the listener errors.
+func (s *Session) AcceptDirect(ctx context.Context, ln transport.Listener) error {
+	for {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("session: accept direct: %w", err)
+		}
+		go s.acceptDirectStreams(ctx, c)
+	}
+}
+
+func (s *Session) acceptDirectStreams(ctx context.Context, c transport.Conn) {
+	for {
+		st, err := c.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		go s.handleDirectStream(st)
+	}
+}
+
+func (s *Session) handleDirectStream(st transport.Stream) {
+	f, err := orp.ParseFrame(st)
+	if err != nil {
+		s.logger.Warn("session: direct: read first frame", "err", err)
+		_ = st.Close()
+		return
+	}
+	if f.Type != orp.FrameTypeStreamResume {
+		s.logger.Warn("session: direct: expected STREAM_RESUME", "got", f.Type)
+		_ = st.Close()
+		return
+	}
+	peer := &orpv1.StreamResume{}
+	if err := orp.UnmarshalProto(f, orp.FrameTypeStreamResume, peer); err != nil {
+		_ = st.Close()
+		return
+	}
+
+	sid := resume.StreamID(peer.StreamId)
+	s.mu.RLock()
+	rs, ok := s.streams[sid]
+	s.mu.RUnlock()
+	if !ok {
+		s.logger.Warn("session: direct: unknown stream id", "id", sid.String())
+		_ = st.Close()
+		return
+	}
+
+	// Retransmit anything the peer hasn't yet acknowledged from our
+	// side, then swap the wrapper's inner. PeerAckPosition fits in
+	// int64 (it's a byte counter, never negative).
+	gap, err := rs.state.RetransmitFrom(int64(peer.PeerAckPosition)) // #nosec G115
+	if err != nil {
+		s.logger.Warn("session: direct: retransmit gap unavailable", "err", err)
+		_ = st.Close()
+		return
+	}
+	if len(gap) > 0 {
+		if _, err := st.Write(gap); err != nil {
+			s.logger.Warn("session: direct: retransmit write", "err", err)
+			_ = st.Close()
+			return
+		}
+	}
+	rs.SwapInner(st)
+	s.logger.Info("session: direct: migrated", "id", sid.String())
+}
+
+// MigrateToDirect moves an in-flight ResumableStream off the relay
+// onto a direct peer-to-peer transport. It opens a fresh stream on
+// peerConn, writes STREAM_RESUME so the peer agent's resume matcher
+// pairs it, and SwapInners the ResumableStream's underlying
+// transport over to the direct path.
 //
 // On error the original inner is left untouched so the caller can
 // retry or fall back to relay-mediated I/O.

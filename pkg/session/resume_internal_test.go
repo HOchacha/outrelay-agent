@@ -16,10 +16,11 @@ import (
 	"github.com/boanlab/OutRelay/lib/resume"
 )
 
-// TestCompleteResumeRetransmitsGap verifies the §3.18.4 step T5
-// behavior: after the relay echoes the peer's STREAM_RESUME, the
-// agent reads peer.peer_ack_position and writes ring-buffered bytes
-// (peer.peer_ack, my.sent] back onto the new stream.
+// TestCompleteResumeRetransmitsGap verifies the gap-retransmit
+// step of stream resume: after the relay echoes the peer's
+// STREAM_RESUME, the agent reads peer.peer_ack_position and writes
+// ring-buffered bytes (peer.peer_ack, my.sent] back onto the new
+// stream.
 func TestCompleteResumeRetransmitsGap(t *testing.T) {
 	t.Parallel()
 
@@ -66,8 +67,8 @@ func TestCompleteResumeMismatchedStreamID(t *testing.T) {
 	}
 }
 
-// TestCompleteResumeBeforeRing surfaces the irrecoverable case from
-// §3.18.6 — peer asks for bytes the ring already evicted.
+// TestCompleteResumeBeforeRing surfaces the irrecoverable case where
+// the peer asks for bytes the ring has already evicted.
 func TestCompleteResumeBeforeRing(t *testing.T) {
 	t.Parallel()
 	id := resume.StreamID(0x1)
@@ -106,8 +107,9 @@ func (b *bidiStream) Write(p []byte) (int, error) {
 	return b.writeBuf.Write(p)
 }
 
-func (b *bidiStream) Close() error     { return nil }
-func (b *bidiStream) StreamID() uint64 { return 0 }
+func (b *bidiStream) Close() error        { return nil }
+func (b *bidiStream) StreamID() uint64    { return 0 }
+func (b *bidiStream) CancelRead(_ uint64) {}
 
 // mustEncodeFrame marshals msg into ORP framing for test fixtures.
 func mustEncodeFrame(t *testing.T, typ orp.FrameType, msg proto.Message) []byte {

@@ -2,7 +2,7 @@
 // Copyright 2026 BoanLab @ Dankook University
 
 // Package intercept turns local application traffic into ORP service
-// dials. Two modes are supported (§3.8):
+// dials. Two modes are supported:
 //
 // - explicit: agent listens on 127.0.0.1:<port> per service; the
 // application dials the port directly.
