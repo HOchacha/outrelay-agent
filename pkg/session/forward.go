@@ -114,6 +114,11 @@ func DialForward(
 	}
 	logger.Debug("session: forward UDP registered",
 		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation)
+	// Arm dead-path detection: if no inbound datagrams for the idle
+	// window, close the UDP socket so the e2e QUIC layer above sees a
+	// hard error instead of burning keepalives at a relay whose
+	// allocation has been wiped (e.g., post-restart).
+	udp.WatchIdle(ctx, forward.DefaultIdleTimeout)
 	tr := &quic.Transport{Conn: udp}
 
 	tlsConf = ensureForwardALPN(tlsConf)
@@ -184,6 +189,10 @@ func AcceptForward(
 	}
 	logger.Debug("session: forward UDP registered",
 		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation)
+	// Arm dead-path detection symmetric with DialForward — relay restart
+	// looks the same from either side, so both sides want to fail fast
+	// when datagrams stop arriving.
+	udp.WatchIdle(ctx, forward.DefaultIdleTimeout)
 	tr := &quic.Transport{Conn: udp}
 
 	tlsConf = ensureForwardALPN(tlsConf)

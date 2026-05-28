@@ -20,6 +20,7 @@
 package forward
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,8 +28,18 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 )
+
+// DefaultIdleTimeout is the recommended argument to WatchIdle. It
+// comfortably outlives one or two e2e QUIC keepalive intervals so a
+// healthy relay+peer doesn't trip it, but cuts the agent off well
+// before the e2e QUIC connection's own idle timeout (which can be
+// 30s–2min depending on quic-go defaults) and stops the agent from
+// burning the relay's "drop (alloc not registered)" log spam if the
+// relay's allocation has been wiped (e.g., relay restart).
+const DefaultIdleTimeout = 20 * time.Second
 
 // Conn satisfies net.PacketConn. quic.Transport uses it as its
 // underlying socket.
@@ -39,6 +50,11 @@ type Conn struct {
 	peerAlloc uint32
 	myAlloc   uint32
 	logger    *slog.Logger
+
+	// lastInbound is the unix-nano timestamp of the most recent
+	// successful ReadFrom. WatchIdle reads this atomically to decide
+	// whether to close the conn.
+	lastInbound atomic.Int64
 }
 
 // Dial opens a UDP socket, registers myAlloc with the relay's
@@ -111,12 +127,71 @@ func (c *Conn) WriteTo(p []byte, _ net.Addr) (int, error) {
 // peer's WriteTo handed in. The returned addr is the relay's
 // endpoint — quic-go uses it as the connection's stable "remote"
 // for the lifetime of the connection.
+//
+// Successful reads bump an internal lastInbound timestamp consumed
+// by WatchIdle for dead-path detection.
 func (c *Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, _, err := c.udp.ReadFromUDPAddrPort(p)
 	if err != nil {
 		return 0, nil, err
 	}
+	c.lastInbound.Store(time.Now().UnixNano())
 	return n, c.relayAddr, nil
+}
+
+// WatchIdle starts a background goroutine that closes this Conn if
+// no inbound packet has been observed for idleTimeout. Use this to
+// fail fast when the relay restarts (or otherwise wipes our
+// allocation): the e2e QUIC tunnel layered on top sees the closed
+// socket as an unrecoverable error and the caller's bridge exits,
+// letting the application decide whether to redial.
+//
+// The watcher is armed at call time (treats "now" as the most recent
+// inbound) so a freshly-Dialed Conn doesn't immediately trip while
+// the e2e QUIC handshake is still in flight. Stop the watcher by
+// cancelling ctx or by calling Close — either causes the goroutine
+// to return on its next tick.
+//
+// Idempotency: WatchIdle may be called more than once but each call
+// spawns a new watcher; callers should invoke it exactly once
+// per Conn lifetime.
+func (c *Conn) WatchIdle(ctx context.Context, idleTimeout time.Duration) {
+	if idleTimeout <= 0 {
+		return
+	}
+	c.lastInbound.Store(time.Now().UnixNano())
+	interval := idleTimeout / 4
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		thresholdNs := idleTimeout.Nanoseconds()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				last := c.lastInbound.Load()
+				if last == 0 {
+					continue
+				}
+				idleNs := now.UnixNano() - last
+				if idleNs <= thresholdNs {
+					continue
+				}
+				c.logger.Warn("forward: conn idle, closing",
+					"my_alloc", c.myAlloc, "peer_alloc", c.peerAlloc,
+					"idle_s", idleNs/int64(time.Second))
+				_ = c.udp.Close()
+				return
+			}
+		}
+	}()
 }
 
 func (c *Conn) LocalAddr() net.Addr                { return c.udp.LocalAddr() }
