@@ -98,7 +98,7 @@ func TestExplicitInterceptToSession(t *testing.T) {
 	probe.Close()
 	ic, err := intercept.NewExplicit([]intercept.ExplicitMapping{
 		{BindAddr: bindAddr, TargetSvc: "svc-echo"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

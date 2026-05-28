@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -85,35 +86,60 @@ func (s *Session) controlReader(ctx context.Context) {
 		case orp.FrameTypeCandidateAnswer:
 			a := &orpv1.CandidateAnswer{}
 			if err := orp.UnmarshalProto(f, orp.FrameTypeCandidateAnswer, a); err != nil {
+				s.logger.Warn("session: CANDIDATE_ANSWER unmarshal failed", "err", err)
 				continue
 			}
+			s.logger.Debug("session: CANDIDATE_ANSWER received",
+				"stream_id", a.StreamId, "candidates", len(a.Candidates))
 			s.deliverAnswer(a)
 		case orp.FrameTypeCandidateOffer:
 			o := &orpv1.CandidateOffer{}
 			if err := orp.UnmarshalProto(f, orp.FrameTypeCandidateOffer, o); err != nil {
+				s.logger.Warn("session: CANDIDATE_OFFER unmarshal failed", "err", err)
 				continue
 			}
+			s.logger.Debug("session: CANDIDATE_OFFER received",
+				"stream_id", o.StreamId, "candidates", len(o.Candidates))
 			ans := s.AnswerOffer(o)
+			s.logger.Debug("session: sending CANDIDATE_ANSWER",
+				"stream_id", ans.StreamId, "candidates", len(ans.Candidates))
 			if err := s.writeCtrl(orp.FrameTypeCandidateAnswer, ans); err != nil {
 				s.logger.Warn("session: write CANDIDATE_ANSWER", "err", err)
 			}
+			// Responder-side warmup punch. By the time the initiator's
+			// Engine.Check dials our srflx, our NAT must already have an
+			// outbound conntrack entry whose reply tuple matches the
+			// initiator's src — otherwise port-restricted NAT (e.g. Linux
+			// MASQUERADE in CloudStack VR, AWS NAT GW) drops the inbound
+			// as a NEW connection. Sending one byte to each peer
+			// candidate from our SharedTransport socket pre-creates that
+			// entry. No-op when running on DefaultDialer (no shared
+			// socket, no NAT semantics to defeat).
+			s.warmupPunch(o.StreamId, o.GetCandidates())
 		case orp.FrameTypeStreamCheckpoint:
 			cp := &orpv1.StreamCheckpoint{}
 			if err := orp.UnmarshalProto(f, orp.FrameTypeStreamCheckpoint, cp); err != nil {
+				s.logger.Warn("session: STREAM_CHECKPOINT unmarshal failed", "err", err)
 				continue
 			}
 			s.applyCheckpoint(cp)
 		case orp.FrameTypeAllocGranted:
 			g := &orpv1.AllocGranted{}
 			if err := orp.UnmarshalProto(f, orp.FrameTypeAllocGranted, g); err != nil {
+				s.logger.Warn("session: ALLOC_GRANTED unmarshal failed", "err", err)
 				continue
 			}
+			s.logger.Info("session: stream mode resolved by relay (forward)",
+				"stream_id", g.StreamId, "my_alloc", g.MyAllocation,
+				"peer_alloc", g.PeerAllocation, "endpoint", g.ForwardEndpoint)
 			s.deliverMode(g.StreamId, streamModeNotice{granted: g})
 		case orp.FrameTypeStreamReady:
 			r := &orpv1.StreamReady{}
 			if err := orp.UnmarshalProto(f, orp.FrameTypeStreamReady, r); err != nil {
+				s.logger.Warn("session: STREAM_READY unmarshal failed", "err", err)
 				continue
 			}
+			s.logger.Info("session: stream mode resolved by relay (splice)", "stream_id", r.StreamId)
 			s.deliverMode(r.StreamId, streamModeNotice{}) // splice
 		default:
 			s.logger.Warn("session: unexpected ctrl frame", "type", f.Type)
@@ -150,6 +176,60 @@ func (s *Session) AnswerOffer(offer *orpv1.CandidateOffer) *orpv1.CandidateAnswe
 	}
 }
 
+// warmupPunch sends a one-byte UDP datagram to every peer candidate
+// from this session's SharedTransport socket. The QUIC layer is
+// bypassed — the peer's quic-go demuxer drops the malformed datagram.
+// The sole effect is to register an outbound conntrack entry on this
+// side's NAT keyed by (local_socket → peer_addr); the initiator's
+// subsequent dial from a different src then matches the reply tuple
+// of that entry and is delivered by NAT instead of being treated as a
+// fresh inbound and dropped.
+//
+// No-op if the session is not using a SharedTransport (e.g. the agent
+// was started without --p2p-listen, or fell back to TCP). Errors per
+// candidate are logged at debug and otherwise ignored — a routing
+// failure to one address must not block the others.
+func (s *Session) warmupPunch(streamID uint64, cands []*orpv1.Candidate) {
+	s.logger.Debug("session: warmup punch enter",
+		"stream_id", streamID,
+		"candidates_in", len(cands),
+		"dialer_type", fmt.Sprintf("%T", s.dialer))
+
+	st, ok := s.dialer.(*transport.SharedTransport)
+	if !ok || st == nil {
+		s.logger.Debug("session: warmup punch skipped: dialer is not *SharedTransport",
+			"stream_id", streamID, "dialer_type", fmt.Sprintf("%T", s.dialer))
+		return
+	}
+	for _, c := range cands {
+		if c == nil {
+			s.logger.Debug("session: warmup punch skip: nil candidate",
+				"stream_id", streamID)
+			continue
+		}
+		if c.Ip == "" || c.Port == 0 || c.Port > 0xFFFF {
+			s.logger.Debug("session: warmup punch skip: invalid endpoint",
+				"stream_id", streamID, "kind", c.Kind, "ip", c.Ip, "port", c.Port)
+			continue
+		}
+		ip := net.ParseIP(c.Ip)
+		if ip == nil {
+			s.logger.Debug("session: warmup punch skip: unparseable IP",
+				"stream_id", streamID, "ip", c.Ip)
+			continue
+		}
+		addr := &net.UDPAddr{IP: ip, Port: int(c.Port)}
+		if _, err := st.WriteTo([]byte{0x00}, addr); err != nil {
+			s.logger.Debug("session: warmup punch failed",
+				"stream_id", streamID, "kind", c.Kind,
+				"addr", addr.String(), "err", err)
+			continue
+		}
+		s.logger.Debug("session: warmup punch sent",
+			"stream_id", streamID, "kind", c.Kind, "addr", addr.String())
+	}
+}
+
 // writeCtrl marshals msg into a Frame of typ and writes it onto the
 // shared control stream under ctrlWriteMu.
 func (s *Session) writeCtrl(typ orp.FrameType, msg proto.Message) error {
@@ -173,11 +253,16 @@ func (s *Session) deliverAnswer(a *orpv1.CandidateAnswer) {
 		delete(s.pendingAnswers, a.StreamId)
 	}
 	s.p2pMu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- a:
-		default:
-		}
+	if ch == nil {
+		s.logger.Warn("session: CANDIDATE_ANSWER without waiter",
+			"stream_id", a.StreamId)
+		return
+	}
+	select {
+	case ch <- a:
+	default:
+		s.logger.Warn("session: answer drop (waiter full)",
+			"stream_id", a.StreamId)
 	}
 }
 
@@ -209,6 +294,7 @@ func (s *Session) RegisterStreamModeWaiter(streamID uint64) chan streamModeNotic
 	}
 	s.pendingMode[streamID] = ch
 	s.p2pMu.Unlock()
+	s.logger.Debug("session: stream-mode waiter registered", "stream_id", streamID)
 	return ch
 }
 
@@ -216,19 +302,34 @@ func (s *Session) RegisterStreamModeWaiter(streamID uint64) chan streamModeNotic
 // delivering. Idempotent.
 func (s *Session) CancelStreamModeWaiter(streamID uint64) {
 	s.p2pMu.Lock()
+	_, existed := s.pendingMode[streamID]
 	delete(s.pendingMode, streamID)
 	s.p2pMu.Unlock()
+	if existed {
+		s.logger.Debug("session: stream-mode waiter cancelled", "stream_id", streamID)
+	}
 }
 
 func (s *Session) deliverMode(streamID uint64, n streamModeNotice) {
 	s.p2pMu.Lock()
 	ch := s.pendingMode[streamID]
 	s.p2pMu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- n:
-		default:
-		}
+	mode := "splice"
+	if n.granted != nil {
+		mode = "forward"
+	}
+	if ch == nil {
+		s.logger.Warn("session: stream-mode delivery dropped (no waiter)",
+			"stream_id", streamID, "mode", mode)
+		return
+	}
+	select {
+	case ch <- n:
+		s.logger.Debug("session: stream-mode delivered",
+			"stream_id", streamID, "mode", mode)
+	default:
+		s.logger.Warn("session: stream-mode delivery dropped (waiter full)",
+			"stream_id", streamID, "mode", mode)
 	}
 }
 
@@ -299,27 +400,55 @@ func (s *Session) Promote(ctx context.Context, rs *ResumableStream, eng *p2p.Eng
 	streamID := uint64(rs.state.ID)
 	answerCh := s.registerAnswerWaiter(streamID)
 
+	// Candidate selection priority:
+	//   1. opts.Locals (explicit injection — tests use this)
+	//   2. s.localCandidates (set by main.go's --p2p-listen block via
+	//      SetLocalCandidates: srflx + host candidates at the listener
+	//      port, plus optional --p2p-advertise override). This is the
+	//      production path — bypassing it falls back to port=0 host
+	//      candidates that the responder can't punch toward.
+	//   3. candidate.HostCandidates(opts.HostPort) — bare-port fallback
+	//      for tests / DefaultDialer mode where no listener exists.
 	locals := opts.Locals
 	if len(locals) == 0 {
-		locals = candidate.HostCandidates(opts.HostPort)
+		s.p2pMu.Lock()
+		sessionLocals := append([]*orpv1.Candidate(nil), s.localCandidates...)
+		s.p2pMu.Unlock()
+		if len(sessionLocals) > 0 {
+			locals = p2p.FromPB(sessionLocals)
+		} else {
+			locals = candidate.HostCandidates(opts.HostPort)
+		}
 	}
+
+	s.logger.Debug("session: promote begin", "stream_id", streamID, "locals", len(locals))
+	defer s.logger.Debug("session: promote end", "stream_id", streamID)
 
 	pr := &p2p.Promoter{
 		StreamID: streamID,
 		Engine:   eng,
 		Locals:   locals,
+		Logger:   s.logger,
 		SendOffer: func(o *orpv1.CandidateOffer) error {
+			s.logger.Debug("session: send CANDIDATE_OFFER",
+				"stream_id", o.StreamId, "candidates", len(o.Candidates))
 			return s.writeCtrl(orp.FrameTypeCandidateOffer, o)
 		},
 		RecvAnswer: func(ctx context.Context) (*orpv1.CandidateAnswer, error) {
+			s.logger.Debug("session: waiting for CANDIDATE_ANSWER", "stream_id", streamID)
 			select {
 			case a := <-answerCh:
+				s.logger.Debug("session: CANDIDATE_ANSWER delivered",
+					"stream_id", a.StreamId, "candidates", len(a.Candidates))
 				return a, nil
 			case <-ctx.Done():
+				s.logger.Debug("session: promote ctx done",
+					"stream_id", streamID, "err", ctx.Err())
 				return nil, ctx.Err()
 			}
 		},
 		SendMigrate: func(m *orpv1.MigrateToP2P) error {
+			s.logger.Debug("session: send MIGRATE_TO_P2P", "stream_id", m.StreamId)
 			return s.writeCtrl(orp.FrameTypeMigrateToP2P, m)
 		},
 	}

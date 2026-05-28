@@ -23,6 +23,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"time"
@@ -36,6 +38,7 @@ type Conn struct {
 	relayAddr net.Addr // pre-computed for ReadFrom's return
 	peerAlloc uint32
 	myAlloc   uint32
+	logger    *slog.Logger
 }
 
 // Dial opens a UDP socket, registers myAlloc with the relay's
@@ -43,11 +46,21 @@ type Conn struct {
 // to the peer's allocation. The Conn satisfies net.PacketConn for
 // quic.Transport.
 func Dial(relay netip.AddrPort, myAlloc, peerAlloc uint32) (*Conn, error) {
+	return DialWithLogger(relay, myAlloc, peerAlloc, nil)
+}
+
+// DialWithLogger is Dial with an explicit logger. A nil logger
+// disables logging.
+func DialWithLogger(relay netip.AddrPort, myAlloc, peerAlloc uint32, logger *slog.Logger) (*Conn, error) {
 	if myAlloc == 0 || peerAlloc == 0 {
 		return nil, errors.New("forward: alloc ids must be non-zero")
 	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
+		logger.Warn("forward: bind local UDP failed", "err", err)
 		return nil, fmt.Errorf("forward: bind local UDP: %w", err)
 	}
 	c := &Conn{
@@ -56,6 +69,7 @@ func Dial(relay netip.AddrPort, myAlloc, peerAlloc uint32) (*Conn, error) {
 		relayAddr: net.UDPAddrFromAddrPort(relay),
 		peerAlloc: peerAlloc,
 		myAlloc:   myAlloc,
+		logger:    logger,
 	}
 	if err := c.register(); err != nil {
 		_ = udp.Close()
@@ -69,8 +83,12 @@ func (c *Conn) register() error {
 	binary.BigEndian.PutUint32(buf[0:4], 0) // peer_alloc=0 = registration
 	binary.BigEndian.PutUint32(buf[4:8], c.myAlloc)
 	if _, err := c.udp.WriteToUDPAddrPort(buf, c.relay); err != nil {
+		c.logger.Warn("forward: register failed",
+			"relay", c.relay.String(), "my_alloc", c.myAlloc, "err", err)
 		return fmt.Errorf("forward: register: %w", err)
 	}
+	c.logger.Info("forward: registered with relay",
+		"relay", c.relay.String(), "my_alloc", c.myAlloc, "peer_alloc", c.peerAlloc)
 	return nil
 }
 

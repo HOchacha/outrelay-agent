@@ -44,6 +44,7 @@ type Engine struct {
 	tlsConf *tls.Config
 	perPair time.Duration
 	logger  *slog.Logger
+	dialer  transport.Dialer
 }
 
 // NewEngine returns an engine that uses tlsConf for outgoing direct
@@ -70,6 +71,21 @@ func (e *Engine) SetPerPairTimeout(d time.Duration) {
 // silent. Optional; nil disables.
 func (e *Engine) SetLogger(l *slog.Logger) { e.logger = l }
 
+// SetDialer overrides the default per-attempt UDP socket strategy.
+// Without a dialer, Check() falls back to transport.DialQUIC which
+// allocates a fresh ephemeral UDP socket per attempt — fine for
+// flat-LAN tests but fatal under port-restricted NAT: the
+// initiator's src port no longer matches the responder's pre-warmed
+// conntrack entry (which expects packets from the agent's advertised
+// host candidate port, i.e. its SharedTransport local port). Pass
+// the agent's *transport.SharedTransport here so connectivity checks
+// dial from the same socket the agent's relay connection and inbound
+// P2P listener share — keeping the src port stable across outbound
+// destinations, which is the precondition for EIM-cone NAT traversal
+// and for the responder-side warmup punch in Session.controlReader
+// to actually help.
+func (e *Engine) SetDialer(d transport.Dialer) { e.dialer = d }
+
 // Check iterates remote candidates (sorted by descending priority)
 // and dials each. Returns the first pair whose QUIC handshake
 // completes inside perPair. ctx may shorten the total budget.
@@ -88,11 +104,19 @@ func (e *Engine) Check(ctx context.Context, locals, remotes []candidate.Candidat
 		}
 		dialCtx, cancel := context.WithTimeout(ctx, e.perPair)
 		start := time.Now()
-		conn, err := transport.DialQUIC(dialCtx, r.Addr.String(), e.tlsConf, nil)
+		var (
+			conn transport.Conn
+			err  error
+		)
+		if e.dialer != nil {
+			conn, err = e.dialer.Dial(dialCtx, r.Addr.String(), e.tlsConf, nil)
+		} else {
+			conn, err = transport.DialQUIC(dialCtx, r.Addr.String(), e.tlsConf, nil)
+		}
 		cancel()
 		if err != nil {
 			if e.logger != nil {
-				e.logger.Info("p2p: candidate dial failed",
+				e.logger.Debug("p2p: candidate dial failed",
 					"kind", r.Kind, "addr", r.Addr.String(),
 					"elapsed_ms", time.Since(start).Milliseconds(), "err", err)
 			}
@@ -105,6 +129,11 @@ func (e *Engine) Check(ctx context.Context, locals, remotes []candidate.Candidat
 		var local candidate.Candidate
 		if len(locals) > 0 {
 			local = candidate.Sort(locals)[0]
+		}
+		if e.logger != nil {
+			e.logger.Info("p2p: candidate pair selected",
+				"kind", r.Kind, "addr", r.Addr.String(),
+				"rtt_ms", rtt.Milliseconds())
 		}
 		return &CheckResult{
 			Local:  local,

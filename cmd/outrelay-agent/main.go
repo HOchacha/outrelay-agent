@@ -67,6 +67,7 @@ func main() {
 		p2pAdvertise = flag.String("p2p-advertise", "", "host:port to add as a high-priority candidate alongside auto-detected interface IPs. Use when the agent's external addr (e.g. an AWS EIP, GCP external IP) differs from any local interface — without this, peers see only the unroutable private IP and connectivity check fails.")
 		relayTCP     = flag.String("relay-tcp", "", "comma-separated TCP+TLS+yamux relay endpoints (e.g. relay.example:443). Tried after every --relay endpoint fails. P2P promotion is disabled when the TCP fallback engages — the relay path stays available, suitable for environments that block UDP.")
 		logFormat    = flag.String("log-format", "text", "log format: text or json")
+		logLevel     = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 	)
 	var consumes consumeFlag
@@ -77,7 +78,7 @@ func main() {
 		return
 	}
 
-	logger := newLogger(*logFormat)
+	logger := newLogger(*logFormat, *logLevel)
 	if *certPath == "" || *keyPath == "" || *caPath == "" || *uri == "" {
 		logger.Error("missing required flags", "cert", *certPath, "key", *keyPath, "ca", *caPath, "uri", *uri)
 		os.Exit(2)
@@ -204,6 +205,19 @@ func main() {
 	// the response), and BEFORE any consumer Dial / Promote call.
 	p2pEngine := p2p.NewEngine(tlsConf)
 
+	// Reuse the shared UDP socket for connectivity-check dials. Without
+	// this, p2p.Engine.Check falls back to per-attempt ephemeral
+	// sockets — the QUIC initial src port would no longer match the
+	// agent's advertised host candidate port (= SharedTransport's
+	// listener port), so the responder-side warmup punch's conntrack
+	// reply tuple won't match and port-restricted NAT drops the dial.
+	// With this set, the initiator's dial leaves from the same port
+	// the responder pre-warmed, matching the conntrack reply tuple
+	// and traversing the NAT.
+	if sharedTransport != nil {
+		p2pEngine.SetDialer(sharedTransport)
+	}
+
 	// Optional direct-dial listener. When --p2p-listen is set AND we
 	// connected over QUIC (sharedTransport not nil), the listener
 	// runs on the shared UDP socket. If we fell back to TCP,
@@ -322,7 +336,7 @@ func startInterceptor(ctx context.Context, mode, tproxyAddr, dnsAddr, dnsSuffix 
 				BindAddr: bind, TargetSvc: svc,
 			})
 		}
-		return intercept.NewExplicit(mappings)
+		return intercept.NewExplicit(mappings, logger)
 
 	case "tproxy":
 		alloc, err := intercept.NewVIPAllocator(intercept.DefaultVIPCIDR)
@@ -336,7 +350,7 @@ func startInterceptor(ctx context.Context, mode, tproxyAddr, dnsAddr, dnsSuffix 
 			}
 			logger.Info("vip allocated", "svc", svc, "vip", vip.String())
 		}
-		dns, err := intercept.NewDNSServer(dnsAddr, dnsSuffix, alloc)
+		dns, err := intercept.NewDNSServer(dnsAddr, dnsSuffix, alloc, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -345,7 +359,7 @@ func startInterceptor(ctx context.Context, mode, tproxyAddr, dnsAddr, dnsSuffix 
 				logger.Error("dns server", "err", err)
 			}
 		}()
-		return intercept.NewTProxy(tproxyAddr, alloc)
+		return intercept.NewTProxy(tproxyAddr, alloc, logger)
 
 	default:
 		return nil, fmt.Errorf("unknown intercept mode: %s", mode)
@@ -366,19 +380,27 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 		ic2, err := ic.Accept(ctx)
 		if err != nil {
 			if errors.Is(err, intercept.ErrClosed) || errors.Is(err, context.Canceled) {
+				logger.Debug("intercept loop exiting", "err", err)
 				return
 			}
 			logger.Error("intercept accept", "err", err)
 			return
 		}
+		logger.Debug("intercept: new conn accepted",
+			"svc", ic2.TargetSvc, "orig_dst", ic2.OrigDest.String())
 		go func(in *intercept.InterceptedConn) {
-			defer in.Local.Close()
+			defer func() {
+				logger.Debug("bridge teardown", "svc", in.TargetSvc)
+				_ = in.Local.Close()
+			}()
 			s, err := sess.Dial(ctx, in.TargetSvc, "")
 			if err != nil {
 				logger.Warn("session dial", "svc", in.TargetSvc, "err", err)
 				return
 			}
 			defer func() { _ = s.Close() }()
+			logger.Debug("session: stream opened",
+				"svc", in.TargetSvc, "stream_id", s.StreamID())
 
 			// Relay always tells us the mode after policy resolves.
 			// granted != nil → FORWARD; nil → SPLICE / ctx-cancelled.
@@ -391,7 +413,10 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 						"svc", in.TargetSvc)
 					return
 				}
-				fs, err := session.DialForward(ctx, granted, peerClientTLS)
+				logger.Debug("forward: dialing peer over plane",
+					"svc", in.TargetSvc, "endpoint", granted.ForwardEndpoint,
+					"my_alloc", granted.MyAllocation, "peer_alloc", granted.PeerAllocation)
+				fs, err := session.DialForward(ctx, granted, peerClientTLS, logger)
 				if err != nil {
 					logger.Warn("forward: dial peer over plane failed",
 						"svc", in.TargetSvc, "err", err)
@@ -426,17 +451,21 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 // initiator times out waiting for ANSWER. 1s is empirically far
 // past p99 OPEN_STREAM completion in the smoke topology.
 func tryPromote(parent context.Context, sess *session.Session, rs *session.ResumableStream, eng *p2p.Engine, svc string, logger *slog.Logger) {
+	logger.Debug("p2p: promote scheduled", "svc", svc)
 	go func() {
+		t0 := time.Now()
 		select {
 		case <-time.After(time.Second):
 		case <-parent.Done():
 			return
 		}
+		logger.Debug("p2p: promote starting",
+			"svc", svc, "delay_ms", time.Since(t0).Milliseconds())
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
 		res, err := sess.Promote(ctx, rs, eng, session.PromoteOptions{HostPort: 0})
 		if err != nil {
-			logger.Info("p2p: stayed on relay", "svc", svc, "err", err)
+			logger.Debug("p2p: stayed on relay", "svc", svc, "err", err)
 			return
 		}
 		// Connectivity check passed — migrate the stream's inner
@@ -555,14 +584,28 @@ func loadClientTLS(certPath, keyPath, caPath, serverName string) (*tls.Config, e
 	}, nil
 }
 
-func newLogger(format string) *slog.Logger {
+func newLogger(format, level string) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLogLevel(level)}
 	var h slog.Handler
 	if format == "json" {
-		h = slog.NewJSONHandler(os.Stderr, nil)
+		h = slog.NewJSONHandler(os.Stderr, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stderr, nil)
+		h = slog.NewTextHandler(os.Stderr, opts)
 	}
 	return slog.New(h)
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func signalContext() (context.Context, context.CancelFunc) {

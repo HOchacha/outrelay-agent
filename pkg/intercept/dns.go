@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -31,15 +33,20 @@ type DNSServer struct {
 	listenAddr string
 	suffix     string // dot-prefixed, e.g. ".outrelay" — empty means no suffix
 	alloc      *VIPAllocator
+	logger     *slog.Logger
 
 	mu sync.Mutex
 	pc net.PacketConn
 }
 
-// NewDNSServer constructs (but does not start) a DNS server.
-func NewDNSServer(listenAddr, suffix string, alloc *VIPAllocator) (*DNSServer, error) {
+// NewDNSServer constructs (but does not start) a DNS server. A nil
+// logger disables logging.
+func NewDNSServer(listenAddr, suffix string, alloc *VIPAllocator, logger *slog.Logger) (*DNSServer, error) {
 	if alloc == nil {
 		return nil, errors.New("intercept: nil VIPAllocator")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	suffix = strings.ToLower(strings.TrimSpace(suffix))
 	if suffix != "" && !strings.HasPrefix(suffix, ".") {
@@ -49,6 +56,7 @@ func NewDNSServer(listenAddr, suffix string, alloc *VIPAllocator) (*DNSServer, e
 		listenAddr: listenAddr,
 		suffix:     suffix,
 		alloc:      alloc,
+		logger:     logger,
 	}, nil
 }
 
@@ -67,11 +75,15 @@ func (s *DNSServer) Addr() net.Addr {
 func (s *DNSServer) Run(ctx context.Context) error {
 	pc, err := net.ListenPacket("udp", s.listenAddr)
 	if err != nil {
+		s.logger.Warn("intercept: dns listen failed",
+			"addr", s.listenAddr, "err", err)
 		return fmt.Errorf("intercept: dns listen: %w", err)
 	}
 	s.mu.Lock()
 	s.pc = pc
 	s.mu.Unlock()
+	s.logger.Info("intercept: dns server running",
+		"addr", pc.LocalAddr().String(), "suffix", s.suffix)
 
 	go func() {
 		<-ctx.Done()
@@ -135,13 +147,21 @@ func (s *DNSServer) respond(query []byte) ([]byte, bool) {
 				},
 				Body: &dnsmessage.AResource{A: b},
 			}}
+			s.logger.Debug("intercept: dns A answer",
+				"name", q.Name.String(), "vip", vip.String())
 		} else {
+			s.logger.Debug("intercept: dns A nxdomain",
+				"name", q.Name.String())
 			answer.RCode = dnsmessage.RCodeNameError
 		}
 	case dnsmessage.TypeAAAA:
 		// We don't issue v6 VIPs.
+		s.logger.Debug("intercept: dns AAAA nxdomain (v4 only)",
+			"name", q.Name.String())
 		answer.RCode = dnsmessage.RCodeNameError
 	default:
+		s.logger.Debug("intercept: dns unsupported qtype",
+			"name", q.Name.String(), "type", q.Type.String())
 		answer.RCode = dnsmessage.RCodeNotImplemented
 	}
 

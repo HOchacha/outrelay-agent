@@ -817,10 +817,14 @@ func (s *Session) RunWithReconnect(ctx context.Context, addrs []string, tlsConf 
 		// ctx fires).
 		s.reconnecting.Store(true)
 		backoff := time.Second
+		attempt := 0
 		for {
+			attempt++
+			s.logger.Debug("session: reconnect attempt",
+				"attempt", attempt, "addrs", addrs, "backoff", backoff)
 			rerr := s.Reconnect(ctx, addrs, tlsConf)
 			if rerr == nil {
-				s.logger.Info("session: reconnected")
+				s.logger.Info("session: reconnected", "attempt", attempt)
 				// The old controlReader exited when the previous
 				// ctrl stream errored. Restart it on the fresh ctrl
 				// so P2P promotions keep working after a relay
@@ -828,9 +832,12 @@ func (s *Session) RunWithReconnect(ctx context.Context, addrs []string, tlsConf 
 				s.restartControlReaderIfEnabled()
 				break
 			}
-			s.logger.Warn("session: reconnect attempt failed", "err", rerr)
+			s.logger.Warn("session: reconnect attempt failed",
+				"attempt", attempt, "err", rerr)
 			select {
 			case <-ctx.Done():
+				s.logger.Info("session: reconnect abandoned (ctx done)",
+					"attempt", attempt)
 				s.reconnecting.Store(false)
 				return nil
 			case <-time.After(backoff):
@@ -956,7 +963,7 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 				bridge(wrapped, backend)
 				return
 			}
-			fs, err := AcceptForward(ctx, granted, ftls)
+			fs, err := AcceptForward(ctx, granted, ftls, s.logger)
 			if err != nil {
 				s.logger.Warn("agent: forward accept failed; tearing down stream",
 					"stream_id", in.StreamId, "err", err)

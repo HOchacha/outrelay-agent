@@ -30,7 +30,7 @@ func TestExplicitInterceptor(t *testing.T) {
 	ic2, err := intercept.NewExplicit([]intercept.ExplicitMapping{
 		{BindAddr: addr1, TargetSvc: "svc-payments"},
 		{BindAddr: addr2, TargetSvc: "svc-orders"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestExplicitInterceptorCloseUnblocksAccept(t *testing.T) {
 	t.Parallel()
 	ic, err := intercept.NewExplicit([]intercept.ExplicitMapping{
 		{BindAddr: "127.0.0.1:0", TargetSvc: "svc-x"},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

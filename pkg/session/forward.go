@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 
@@ -88,29 +89,49 @@ func DialForward(
 	ctx context.Context,
 	granted *orpv1.AllocGranted,
 	tlsConf *tls.Config,
+	logger *slog.Logger,
 ) (*ForwardSession, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if granted == nil || granted.MyAllocation == 0 || granted.PeerAllocation == 0 {
 		return nil, errors.New("session: invalid AllocGranted")
 	}
 	relay, err := netip.ParseAddrPort(granted.ForwardEndpoint)
 	if err != nil {
+		logger.Warn("session: forward dial failed at parse_endpoint",
+			"endpoint", granted.ForwardEndpoint, "err", err)
 		return nil, fmt.Errorf("session: parse forward endpoint %q: %w", granted.ForwardEndpoint, err)
 	}
+	logger.Info("session: forward dial start",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
+		"peer_alloc", granted.PeerAllocation, "endpoint", granted.ForwardEndpoint)
 	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation)
 	if err != nil {
+		logger.Warn("session: forward dial failed at udp_dial",
+			"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation, "err", err)
 		return nil, err
 	}
+	logger.Debug("session: forward UDP registered",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation)
 	tr := &quic.Transport{Conn: udp}
 
 	tlsConf = ensureForwardALPN(tlsConf)
 	qc, err := tr.Dial(ctx, forward.PeerSentinel, tlsConf, defaultQUICConfig())
 	if err != nil {
+		logger.Warn("session: forward dial failed at quic_dial",
+			"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation, "err", err)
 		_ = tr.Close()
 		_ = udp.Close()
 		return nil, fmt.Errorf("session: forward dial: %w", err)
 	}
+	logger.Info("session: forward QUIC handshake ok",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
+		"peer_alloc", granted.PeerAllocation)
 	st, err := qc.OpenStreamSync(ctx)
 	if err != nil {
+		logger.Warn("session: forward dial failed at open_stream",
+			"stream_id", granted.StreamId, "err", err)
 		_ = qc.CloseWithError(0, "open stream failed")
 		_ = tr.Close()
 		_ = udp.Close()
@@ -138,23 +159,38 @@ func AcceptForward(
 	ctx context.Context,
 	granted *orpv1.AllocGranted,
 	tlsConf *tls.Config,
+	logger *slog.Logger,
 ) (*ForwardSession, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if granted == nil || granted.MyAllocation == 0 || granted.PeerAllocation == 0 {
 		return nil, errors.New("session: invalid AllocGranted")
 	}
 	relay, err := netip.ParseAddrPort(granted.ForwardEndpoint)
 	if err != nil {
+		logger.Warn("session: forward accept failed at parse_endpoint",
+			"endpoint", granted.ForwardEndpoint, "err", err)
 		return nil, fmt.Errorf("session: parse forward endpoint %q: %w", granted.ForwardEndpoint, err)
 	}
+	logger.Info("session: forward accept start",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
+		"peer_alloc", granted.PeerAllocation, "endpoint", granted.ForwardEndpoint)
 	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation)
 	if err != nil {
+		logger.Warn("session: forward accept failed at udp_dial",
+			"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation, "err", err)
 		return nil, err
 	}
+	logger.Debug("session: forward UDP registered",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation)
 	tr := &quic.Transport{Conn: udp}
 
 	tlsConf = ensureForwardALPN(tlsConf)
 	ln, err := tr.Listen(tlsConf, defaultQUICConfig())
 	if err != nil {
+		logger.Warn("session: forward accept failed at quic_listen",
+			"stream_id", granted.StreamId, "err", err)
 		_ = tr.Close()
 		_ = udp.Close()
 		return nil, fmt.Errorf("session: forward listen: %w", err)
@@ -163,12 +199,19 @@ func AcceptForward(
 
 	qc, err := ln.Accept(ctx)
 	if err != nil {
+		logger.Warn("session: forward accept failed at accept_conn",
+			"stream_id", granted.StreamId, "err", err)
 		_ = tr.Close()
 		_ = udp.Close()
 		return nil, fmt.Errorf("session: forward accept conn: %w", err)
 	}
+	logger.Info("session: forward QUIC peer connected",
+		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
+		"peer_alloc", granted.PeerAllocation)
 	st, err := qc.AcceptStream(ctx)
 	if err != nil {
+		logger.Warn("session: forward accept failed at accept_stream",
+			"stream_id", granted.StreamId, "err", err)
 		_ = qc.CloseWithError(0, "accept stream failed")
 		_ = tr.Close()
 		_ = udp.Close()

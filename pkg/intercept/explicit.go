@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 )
@@ -21,6 +23,7 @@ type explicitInterceptor struct {
 	listeners []net.Listener
 	accepts   chan *InterceptedConn
 	errs      chan error
+	logger    *slog.Logger
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -30,22 +33,31 @@ type explicitInterceptor struct {
 // that emits InterceptedConn for each accepted local connection.
 //
 // On error, any listener already opened is closed before returning so
-// the caller doesn't have to clean up partial state.
-func NewExplicit(mappings []ExplicitMapping) (Interceptor, error) {
+// the caller doesn't have to clean up partial state. A nil logger
+// disables logging.
+func NewExplicit(mappings []ExplicitMapping, logger *slog.Logger) (Interceptor, error) {
 	if len(mappings) == 0 {
 		return nil, errors.New("intercept: no explicit mappings")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	ei := &explicitInterceptor{
 		accepts: make(chan *InterceptedConn),
 		errs:    make(chan error, 1),
+		logger:  logger,
 		closed:  make(chan struct{}),
 	}
 	for _, m := range mappings {
 		ln, err := net.Listen("tcp", m.BindAddr)
 		if err != nil {
 			ei.closeListeners()
+			logger.Warn("intercept: explicit listen failed",
+				"bind", m.BindAddr, "svc", m.TargetSvc, "err", err)
 			return nil, fmt.Errorf("intercept: listen %s: %w", m.BindAddr, err)
 		}
+		logger.Info("intercept: explicit listener bound",
+			"bind", ln.Addr().String(), "svc", m.TargetSvc)
 		ei.listeners = append(ei.listeners, ln)
 		go ei.acceptLoop(ln, m.TargetSvc)
 	}
@@ -61,6 +73,8 @@ func (e *explicitInterceptor) acceptLoop(ln net.Listener, svc string) {
 				return
 			default:
 			}
+			e.logger.Warn("intercept: explicit accept failed",
+				"bind", ln.Addr().String(), "svc", svc, "err", err)
 			// Surface the first error; subsequent errors drop on the floor.
 			select {
 			case e.errs <- err:
@@ -68,6 +82,9 @@ func (e *explicitInterceptor) acceptLoop(ln net.Listener, svc string) {
 			}
 			return
 		}
+		e.logger.Debug("intercept: explicit accepted",
+			"bind", ln.Addr().String(), "svc", svc,
+			"peer", c.RemoteAddr().String())
 		select {
 		case e.accepts <- &InterceptedConn{
 			Local:     c,

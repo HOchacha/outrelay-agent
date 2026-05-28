@@ -130,7 +130,7 @@ func TestE2EForwardModeRoundTrip(t *testing.T) {
 	defer ln.Close()
 
 	ctrlClient := startInProcessControllerForFwd(t)
-	reg := relayreg.New(ctrlClient, "relay-fwd", "")
+	reg := relayreg.New(ctrlClient, "relay-fwd", "", nil)
 
 	srv := edge.New(ln.Addr().String(), nil, reg, eng, policy.NewCache(), nil, nil, plane, nil, slog.New(slog.DiscardHandler))
 	relayCtx, relayCancel := context.WithCancel(t.Context())
@@ -227,7 +227,7 @@ func TestE2EForwardModeRoundTrip(t *testing.T) {
 	// take seconds to complete the e2e QUIC handshake.
 	dialCtx, dialCancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer dialCancel()
-	fs, err := session.DialForward(dialCtx, granted, dialPeerTLS)
+	fs, err := session.DialForward(dialCtx, granted, dialPeerTLS, nil)
 	if err != nil {
 		t.Fatalf("DialForward: %v", err)
 	}
@@ -340,7 +340,7 @@ func startInProcessControllerForFwd(t *testing.T) pb.RegistryClient {
 		t.Fatal(err)
 	}
 	gs := grpc.NewServer()
-	pb.RegisterRegistryServer(gs, ctrlreg.New(st))
+	pb.RegisterRegistryServer(gs, ctrlreg.New(st, nil))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

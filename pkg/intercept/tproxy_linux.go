@@ -10,6 +10,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -24,8 +26,9 @@ import (
 const soOriginalDst = 80
 
 type tproxyInterceptor struct {
-	ln    net.Listener
-	alloc *VIPAllocator
+	ln     net.Listener
+	alloc  *VIPAllocator
+	logger *slog.Logger
 
 	accepts   chan *InterceptedConn
 	closeOnce sync.Once
@@ -42,17 +45,23 @@ type tproxyInterceptor struct {
 //	iptables -t nat -A OUTPUT \
 //	    -p tcp -d 100.64.0.0/10 \
 //	    -j REDIRECT --to-port <port>
-func NewTProxy(listenAddr string, alloc *VIPAllocator) (Interceptor, error) {
+func NewTProxy(listenAddr string, alloc *VIPAllocator, logger *slog.Logger) (Interceptor, error) {
 	if alloc == nil {
 		return nil, errors.New("intercept: nil VIPAllocator")
 	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		logger.Warn("intercept: tproxy listen failed", "addr", listenAddr, "err", err)
 		return nil, fmt.Errorf("intercept: tproxy listen: %w", err)
 	}
+	logger.Info("intercept: tproxy listener bound", "addr", ln.Addr().String())
 	t := &tproxyInterceptor{
 		ln:      ln,
 		alloc:   alloc,
+		logger:  logger,
 		accepts: make(chan *InterceptedConn),
 		closed:  make(chan struct{}),
 	}
@@ -64,23 +73,37 @@ func (t *tproxyInterceptor) acceptLoop() {
 	for {
 		c, err := t.ln.Accept()
 		if err != nil {
+			select {
+			case <-t.closed:
+				return
+			default:
+			}
+			t.logger.Warn("intercept: tproxy accept failed", "err", err)
 			return
 		}
 		tc, ok := c.(*net.TCPConn)
 		if !ok {
+			t.logger.Warn("intercept: tproxy non-TCP conn dropped",
+				"peer", c.RemoteAddr().String())
 			_ = c.Close()
 			continue
 		}
 		dst, err := origDst4(tc)
 		if err != nil {
+			t.logger.Warn("intercept: SO_ORIGINAL_DST failed",
+				"peer", c.RemoteAddr().String(), "err", err)
 			_ = c.Close()
 			continue
 		}
 		svc := t.alloc.Lookup(dst.Addr())
 		if svc == "" {
+			t.logger.Warn("intercept: VIP lookup miss",
+				"peer", c.RemoteAddr().String(), "dst", dst.String())
 			_ = c.Close()
 			continue
 		}
+		t.logger.Debug("intercept: tproxy accepted",
+			"peer", c.RemoteAddr().String(), "dst", dst.String(), "svc", svc)
 		select {
 		case t.accepts <- &InterceptedConn{
 			Local:     c,

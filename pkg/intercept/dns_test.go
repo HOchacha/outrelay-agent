@@ -20,7 +20,7 @@ func TestDNSServerAQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := intercept.NewDNSServer("127.0.0.1:0", "outrelay", alloc)
+	srv, err := intercept.NewDNSServer("127.0.0.1:0", "outrelay", alloc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestDNSServerRejectsForeignSuffix(t *testing.T) {
 	t.Parallel()
 	alloc, _ := intercept.NewVIPAllocator(intercept.DefaultVIPCIDR)
 	_, _ = alloc.Allocate("svc-a")
-	srv, _ := intercept.NewDNSServer("127.0.0.1:0", "outrelay", alloc)
+	srv, _ := intercept.NewDNSServer("127.0.0.1:0", "outrelay", alloc, nil)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	go func() { _ = srv.Run(ctx) }()
