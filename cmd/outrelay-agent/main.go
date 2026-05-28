@@ -425,6 +425,10 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 				defer func() { _ = fs.Close() }()
 				logger.Info("forward: peer connected over forwarding plane",
 					"svc", in.TargetSvc, "endpoint", granted.ForwardEndpoint)
+				// Tell the wrapper not to STREAM_RESUME this on relay
+				// reconnect — bytes flow over fs.Stream(), the
+				// relay-side stream is a liveness signal only.
+				s.MarkForward()
 				bridge(in.Local, fs.Stream())
 				return
 			}

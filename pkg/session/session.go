@@ -452,6 +452,19 @@ type ResumableStream struct {
 	// Close was called. Read / Write observe it and return
 	// ErrStreamLost; bridges then exit cleanly.
 	abandoned bool
+
+	// forwardMode marks streams whose data is carried over an e2e QUIC
+	// tunnel on the relay's forward plane rather than the relay-mediated
+	// splice path. The relay-side stream this wrapper holds is then a
+	// liveness signal only — replaying STREAM_RESUME on it after a
+	// relay-side reconnect is useless (the relay has no matching peer
+	// half to pair with) and pollutes the resume matcher with entries
+	// that can never complete. Reconnect's Resume loop checks this flag
+	// and skips. Phase 2 of forward-mode recovery (FORWARD_RESUME wire
+	// + ResumableForwardStream wrapper) will replace this skip with
+	// real transparent resume; for now it just keeps the wire and the
+	// metrics clean.
+	forwardMode bool
 }
 
 func (r *ResumableStream) Read(p []byte) (int, error) {
@@ -556,6 +569,32 @@ func (r *ResumableStream) Close() error {
 	inner := r.inner
 	r.mu.RUnlock()
 	return inner.Close()
+}
+
+// MarkForward declares that this stream's data is carried over the
+// relay's forward plane via an e2e QUIC tunnel, not via the
+// relay-mediated splice path. The wrapper still tracks the relay-side
+// stream as a liveness signal, but on Reconnect we skip STREAM_RESUME
+// for it — there's no peer half on the relay's resume matcher to pair
+// with, and the wrapper's bytes counters do not reflect application
+// data anyway. Call once, right after the stream's mode is confirmed
+// as FORWARD (AllocGranted received).
+//
+// Idempotent. Currently does not undo: a stream that has been marked
+// forward stays marked for its lifetime. If FORWARD ever degrades
+// back to relay-mediated splice in some future flow, this would need
+// an explicit clear.
+func (r *ResumableStream) MarkForward() {
+	r.mu.Lock()
+	r.forwardMode = true
+	r.mu.Unlock()
+}
+
+// isForward reports whether MarkForward has been called.
+func (r *ResumableStream) isForward() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.forwardMode
 }
 
 // markAbandoned signals to in-flight Read / Write that no further
@@ -781,12 +820,25 @@ func (s *Session) Reconnect(ctx context.Context, addrs []string, tlsConf *tls.Co
 		}
 	}
 
-	// Replay STREAM_RESUME for every active stream. Resume swaps each
-	// wrapper's inner to the new transport in place, so bridge
+	// Replay STREAM_RESUME for every active splice stream. Resume swaps
+	// each wrapper's inner to the new transport in place, so bridge
 	// goroutines transparently continue once the matcher pairs the
 	// halves on the new relay.
+	//
+	// Forward-mode streams are skipped: their relay-side stream is a
+	// liveness signal only, so sending STREAM_RESUME for it would
+	// add an unpairable entry to the relay's resume matcher and never
+	// resolve. Application data on a forward stream rides the e2e
+	// QUIC tunnel over the forward plane, which is unaffected by
+	// this loop; that path's own recovery is the subject of Phase 2
+	// (FORWARD_RESUME wire protocol + ResumableForwardStream wrapper).
 	streams := s.ActiveStreams()
 	for _, rs := range streams {
+		if rs.isForward() {
+			s.logger.Debug("session: skipping STREAM_RESUME for forward-mode stream",
+				"id", rs.state.ID.String())
+			continue
+		}
 		if err := s.Resume(ctx, rs); err != nil {
 			s.logger.Warn("session: resume stream failed; dropping",
 				"id", rs.state.ID.String(), "err", err)
@@ -973,6 +1025,9 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 			defer func() { _ = fs.Close() }()
 			// In forward mode the relay-mediated stream is just a
 			// liveness signal. Bytes flow over fs.Stream() ↔ backend.
+			// Tell the wrapper not to STREAM_RESUME this on relay
+			// reconnect — there is no peer half to pair with.
+			wrapped.MarkForward()
 			bridge(fs.Stream(), backend)
 			return
 		}
