@@ -152,7 +152,7 @@ func TestReadFromBumpsLastInbound(t *testing.T) {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	after := c.lastInbound.Load()
-	if !(after > before) {
+	if after <= before {
 		t.Fatalf("lastInbound did not advance: before=%d after=%d", before, after)
 	}
 }
