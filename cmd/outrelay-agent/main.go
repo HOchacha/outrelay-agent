@@ -422,14 +422,22 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 						"svc", in.TargetSvc, "err", err)
 					return
 				}
-				defer func() { _ = fs.Close() }()
 				logger.Info("forward: peer connected over forwarding plane",
 					"svc", in.TargetSvc, "endpoint", granted.ForwardEndpoint)
-				// Tell the wrapper not to STREAM_RESUME this on relay
-				// reconnect — bytes flow over fs.Stream(), the
-				// relay-side stream is a liveness signal only.
+				// Tell the wrapper not to STREAM_RESUME the relay-side
+				// stream on reconnect — for forward streams bytes flow
+				// over the e2e tunnel (fs.Stream()), the relay-side
+				// stream is a liveness signal only.
 				s.MarkForward()
-				bridge(in.Local, fs.Stream())
+				// Wrap fs in a ResumableForwardStream so a relay
+				// reconnect can drive PrepareResume (rebuild the
+				// tunnel + tunnel-internal STREAM_RESUME) transparently
+				// under the bridge. The wrapper takes ownership of fs
+				// and closes it on its own Close.
+				rfs := session.WrapForward(sess, granted.StreamId, fs,
+					session.ForwardRoleInitiator, peerClientTLS, logger)
+				defer func() { _ = rfs.Close() }()
+				bridge(in.Local, rfs)
 				return
 			}
 

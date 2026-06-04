@@ -129,6 +129,28 @@ func (s *Session) controlReader(ctx context.Context) {
 				s.logger.Warn("session: ALLOC_GRANTED unmarshal failed", "err", err)
 				continue
 			}
+			// Resume vs new-stream dispatch: an AllocGranted whose
+			// stream_id is already tracked by a ResumableForwardStream
+			// wrapper is the relay's response to our FORWARD_RESUME
+			// after reconnect — feed it to PrepareResume rather than
+			// to the new-stream mode waiter (which is no longer
+			// waiting for this id). Run PrepareResume on its own
+			// goroutine so the controlReader never blocks on the
+			// tunnel rebuild + STREAM_RESUME exchange.
+			if rfs := s.LookupForwardStream(g.StreamId); rfs != nil {
+				s.logger.Info("session: forward resume granted by relay",
+					"stream_id", g.StreamId, "my_alloc", g.MyAllocation,
+					"peer_alloc", g.PeerAllocation, "endpoint", g.ForwardEndpoint)
+				go func(rfs *ResumableForwardStream, g *orpv1.AllocGranted) {
+					if err := rfs.PrepareResume(ctx, g); err != nil {
+						s.logger.Warn("session: forward resume failed; abandoning wrapper",
+							"stream_id", g.StreamId, "err", err)
+						rfs.markAbandoned()
+						s.ForgetForwardStream(g.StreamId)
+					}
+				}(rfs, g)
+				continue
+			}
 			s.logger.Info("session: stream mode resolved by relay (forward)",
 				"stream_id", g.StreamId, "my_alloc", g.MyAllocation,
 				"peer_alloc", g.PeerAllocation, "endpoint", g.ForwardEndpoint)

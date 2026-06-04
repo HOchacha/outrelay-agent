@@ -885,13 +885,10 @@ func (s *Session) Reconnect(ctx context.Context, addrs []string, tlsConf *tls.Co
 	// goroutines transparently continue once the matcher pairs the
 	// halves on the new relay.
 	//
-	// Forward-mode streams are skipped: their relay-side stream is a
-	// liveness signal only, so sending STREAM_RESUME for it would
-	// add an unpairable entry to the relay's resume matcher and never
-	// resolve. Application data on a forward stream rides the e2e
-	// QUIC tunnel over the forward plane, which is unaffected by
-	// this loop; that path's own recovery is the subject of Phase 2
-	// (FORWARD_RESUME wire protocol + ResumableForwardStream wrapper).
+	// Forward-mode streams are skipped here — their relay-side stream
+	// is a liveness signal only — and FORWARD_RESUME is sent instead
+	// (see below) so the relay's forwardMatcher can re-pair the two
+	// halves and re-emit AllocGranted with fresh allocations.
 	streams := s.ActiveStreams()
 	for _, rs := range streams {
 		if rs.isForward() {
@@ -904,6 +901,31 @@ func (s *Session) Reconnect(ctx context.Context, addrs []string, tlsConf *tls.Co
 				"id", rs.state.ID.String(), "err", err)
 			s.forgetStream(rs.state.ID)
 		}
+	}
+
+	// Replay FORWARD_RESUME for every active forward-mode stream so
+	// the relay's forwardMatcher can re-pair the two halves and emit
+	// a fresh AllocGranted to each agent. The controlReader then
+	// routes the resume-shaped AllocGranted into
+	// ResumableForwardStream.PrepareResume, which rebuilds the tunnel
+	// and SwapInners — bridge goroutines continue transparently.
+	// See hocha-work/forward-resume-flow.md.
+	forwards := s.ActiveForwardStreams()
+	for _, rfs := range forwards {
+		myPos, peerAck := rfs.state.ResumePayload()
+		if err := s.writeCtrl(orp.FrameTypeForwardResume, &orpv1.ForwardResume{
+			StreamId:        rfs.streamID,
+			MyPosition:      uint64(myPos),   // #nosec G115 -- byte count, never negative
+			PeerAckPosition: uint64(peerAck), // #nosec G115 -- byte count, never negative
+		}); err != nil {
+			s.logger.Warn("session: send FORWARD_RESUME failed; abandoning wrapper",
+				"stream_id", rfs.streamID, "err", err)
+			rfs.markAbandoned()
+			s.ForgetForwardStream(rfs.streamID)
+			continue
+		}
+		s.logger.Debug("session: FORWARD_RESUME sent",
+			"stream_id", rfs.streamID, "my_pos", myPos, "peer_ack_pos", peerAck)
 	}
 	return nil
 }
@@ -1082,13 +1104,21 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 				_ = backend.Close()
 				return
 			}
-			defer func() { _ = fs.Close() }()
 			// In forward mode the relay-mediated stream is just a
 			// liveness signal. Bytes flow over fs.Stream() ↔ backend.
-			// Tell the wrapper not to STREAM_RESUME this on relay
-			// reconnect — there is no peer half to pair with.
+			// Tell the wrapper not to STREAM_RESUME the relay-side
+			// stream on reconnect — there is no peer half to pair
+			// with on the splice resume matcher.
 			wrapped.MarkForward()
-			bridge(fs.Stream(), backend)
+			// Wrap fs in a ResumableForwardStream so a relay
+			// reconnect can drive PrepareResume (rebuild the tunnel
+			// + tunnel-internal STREAM_RESUME) transparently under
+			// the bridge. The wrapper takes ownership of fs and
+			// closes it on its own Close.
+			rfs := WrapForward(s, in.StreamId, fs,
+				ForwardRoleResponder, ftls, s.logger)
+			defer func() { _ = rfs.Close() }()
+			bridge(rfs, backend)
 			return
 		}
 	}
