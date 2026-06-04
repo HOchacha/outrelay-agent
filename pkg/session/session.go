@@ -109,6 +109,17 @@ type Session struct {
 	// to the relay-mediated splice path (defensive — the relay only
 	// sends AllocGranted when its own --listen-forward is enabled).
 	forwardServerTLS *tls.Config
+
+	// forwardStreamsMu protects forwardStreams independently of mu so
+	// the controlReader's AllocGranted resume dispatch never contends
+	// with the splice-stream registry.
+	forwardStreamsMu sync.RWMutex
+	// forwardStreams indexes active ResumableForwardStream wrappers by
+	// stream_id. Populated by WrapForward, drained by ResumableForwardStream.Close.
+	// Reconnect iterates this map to emit FORWARD_RESUME, and the
+	// controlReader's AllocGranted handler looks up wrappers here to
+	// distinguish a resume from a brand-new forward stream.
+	forwardStreams map[uint64]*ResumableForwardStream
 }
 
 // SetForwardServerTLS enables provider-side acceptance of
@@ -131,6 +142,55 @@ func (s *Session) forwardTLS() *tls.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.forwardServerTLS
+}
+
+// RegisterForwardStream tracks a ResumableForwardStream wrapper so
+// the Reconnect hook can iterate it for FORWARD_RESUME and the
+// controlReader can route a subsequent AllocGranted to it on resume.
+// Called by WrapForward; safe to call multiple times for the same id
+// (later registration replaces earlier, mirroring re-bring-up).
+func (s *Session) RegisterForwardStream(id uint64, rfs *ResumableForwardStream) {
+	if rfs == nil {
+		return
+	}
+	s.forwardStreamsMu.Lock()
+	if s.forwardStreams == nil {
+		s.forwardStreams = map[uint64]*ResumableForwardStream{}
+	}
+	s.forwardStreams[id] = rfs
+	s.forwardStreamsMu.Unlock()
+}
+
+// ForgetForwardStream removes a wrapper from the tracking map. Called
+// by ResumableForwardStream.Close and by the controlReader when a
+// fatal resume failure abandons the wrapper. Idempotent.
+func (s *Session) ForgetForwardStream(id uint64) {
+	s.forwardStreamsMu.Lock()
+	delete(s.forwardStreams, id)
+	s.forwardStreamsMu.Unlock()
+}
+
+// LookupForwardStream returns the wrapper for id, or nil if no such
+// wrapper is tracked. Used by the controlReader to distinguish
+// "AllocGranted for an existing stream" (resume) from "AllocGranted
+// for a brand-new stream" (initial bring-up).
+func (s *Session) LookupForwardStream(id uint64) *ResumableForwardStream {
+	s.forwardStreamsMu.RLock()
+	defer s.forwardStreamsMu.RUnlock()
+	return s.forwardStreams[id]
+}
+
+// ActiveForwardStreams snapshots the current set of wrappers, used by
+// the Reconnect hook to send FORWARD_RESUME without holding the
+// stream-tracking lock across the (potentially slow) ctrl writes.
+func (s *Session) ActiveForwardStreams() []*ResumableForwardStream {
+	s.forwardStreamsMu.RLock()
+	defer s.forwardStreamsMu.RUnlock()
+	out := make([]*ResumableForwardStream, 0, len(s.forwardStreams))
+	for _, rfs := range s.forwardStreams {
+		out = append(out, rfs)
+	}
+	return out
 }
 
 // DialAny tries each address in addrs in order and returns the first
