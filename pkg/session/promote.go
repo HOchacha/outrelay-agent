@@ -163,6 +163,19 @@ func (s *Session) controlReader(ctx context.Context) {
 			}
 			s.logger.Info("session: stream mode resolved by relay (splice)", "stream_id", r.StreamId)
 			s.deliverMode(r.StreamId, streamModeNotice{}) // splice
+		case orp.FrameTypeForwardRegisterReject:
+			r := &orpv1.ForwardRegisterReject{}
+			if err := orp.UnmarshalProto(f, orp.FrameTypeForwardRegisterReject, r); err != nil {
+				s.logger.Warn("session: FORWARD_REGISTER_REJECT unmarshal failed", "err", err)
+				continue
+			}
+			// The matching forward.Dial is currently blocked inside its
+			// quic.Transport.Dial until WatchIdle (~20s) trips. A future
+			// follow-up should plumb this through a per-alloc reject
+			// channel so the Dial can abort immediately; for now the
+			// log line at least makes the cause visible during triage.
+			s.logger.Warn("session: relay rejected FORWARD_REGISTER",
+				"alloc_id", r.AllocId, "reason", r.Reason)
 		default:
 			s.logger.Warn("session: unexpected ctrl frame", "type", f.Type)
 		}
