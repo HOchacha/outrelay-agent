@@ -416,7 +416,13 @@ func runConsumer(ctx context.Context, ic intercept.Interceptor, sess *session.Se
 				logger.Debug("forward: dialing peer over plane",
 					"svc", in.TargetSvc, "endpoint", granted.ForwardEndpoint,
 					"my_alloc", granted.MyAllocation, "peer_alloc", granted.PeerAllocation)
-				fs, err := session.DialForward(ctx, granted, peerClientTLS, logger)
+				nonce, err := sess.ArmForwardRegister(granted.MyAllocation)
+				if err != nil {
+					logger.Warn("forward: arm ForwardRegister failed",
+						"svc", in.TargetSvc, "err", err)
+					return
+				}
+				fs, err := session.DialForward(ctx, granted, peerClientTLS, nonce, logger)
 				if err != nil {
 					logger.Warn("forward: dial peer over plane failed",
 						"svc", in.TargetSvc, "err", err)

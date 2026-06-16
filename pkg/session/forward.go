@@ -89,6 +89,7 @@ func DialForward(
 	ctx context.Context,
 	granted *orpv1.AllocGranted,
 	tlsConf *tls.Config,
+	punchNonce [forward.PunchNonceSize]byte,
 	logger *slog.Logger,
 ) (*ForwardSession, error) {
 	if logger == nil {
@@ -106,7 +107,7 @@ func DialForward(
 	logger.Info("session: forward dial start",
 		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
 		"peer_alloc", granted.PeerAllocation, "endpoint", granted.ForwardEndpoint)
-	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation)
+	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation, punchNonce)
 	if err != nil {
 		logger.Warn("session: forward dial failed at udp_dial",
 			"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation, "err", err)
@@ -164,6 +165,7 @@ func AcceptForward(
 	ctx context.Context,
 	granted *orpv1.AllocGranted,
 	tlsConf *tls.Config,
+	punchNonce [forward.PunchNonceSize]byte,
 	logger *slog.Logger,
 ) (*ForwardSession, error) {
 	if logger == nil {
@@ -181,7 +183,7 @@ func AcceptForward(
 	logger.Info("session: forward accept start",
 		"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation,
 		"peer_alloc", granted.PeerAllocation, "endpoint", granted.ForwardEndpoint)
-	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation)
+	udp, err := forward.Dial(relay, granted.MyAllocation, granted.PeerAllocation, punchNonce)
 	if err != nil {
 		logger.Warn("session: forward accept failed at udp_dial",
 			"stream_id", granted.StreamId, "my_alloc", granted.MyAllocation, "err", err)

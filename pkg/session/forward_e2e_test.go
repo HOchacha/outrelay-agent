@@ -227,7 +227,11 @@ func TestE2EForwardModeRoundTrip(t *testing.T) {
 	// take seconds to complete the e2e QUIC handshake.
 	dialCtx, dialCancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer dialCancel()
-	fs, err := session.DialForward(dialCtx, granted, dialPeerTLS, nil)
+	nonce, err := consSess.ArmForwardRegister(granted.MyAllocation)
+	if err != nil {
+		t.Fatalf("ArmForwardRegister: %v", err)
+	}
+	fs, err := session.DialForward(dialCtx, granted, dialPeerTLS, nonce, nil)
 	if err != nil {
 		t.Fatalf("DialForward: %v", err)
 	}

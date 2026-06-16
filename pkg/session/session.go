@@ -15,6 +15,7 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -28,6 +29,8 @@ import (
 	orpv1 "github.com/boanlab/OutRelay/lib/orp/v1"
 	"github.com/boanlab/OutRelay/lib/resume"
 	"github.com/boanlab/OutRelay/lib/transport"
+
+	"github.com/boanlab/outrelay-agent/pkg/forward"
 )
 
 // IncomingHandler is invoked when the relay sends INCOMING_STREAM to
@@ -191,6 +194,30 @@ func (s *Session) ActiveForwardStreams() []*ResumableForwardStream {
 		out = append(out, rfs)
 	}
 	return out
+}
+
+// ArmForwardRegister generates a fresh 16-byte punch nonce, sends it
+// to the relay on the control stream via FrameTypeForwardRegister, and
+// returns the same bytes so the caller can plug them into the matching
+// forward.Dial(...). The relay binds (alloc -> UDP src) only when both
+// halves agree on the nonce; until that happens, a foreign punch on
+// this alloc is dropped.
+//
+// Call this immediately before DialForward / AcceptForward — the
+// relay's pending entry has a short TTL (~5s) and arms on receipt of
+// the control frame.
+func (s *Session) ArmForwardRegister(allocID uint32) ([forward.PunchNonceSize]byte, error) {
+	var nonce [forward.PunchNonceSize]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nonce, fmt.Errorf("session: arm forward register: read nonce: %w", err)
+	}
+	if err := s.writeCtrl(orp.FrameTypeForwardRegister, &orpv1.ForwardRegister{
+		AllocId:    allocID,
+		PunchNonce: nonce[:],
+	}); err != nil {
+		return nonce, fmt.Errorf("session: arm forward register: write ctrl: %w", err)
+	}
+	return nonce, nil
 }
 
 // DialAny tries each address in addrs in order and returns the first
@@ -1097,7 +1124,14 @@ func (s *Session) handleIncoming(ctx context.Context, st transport.Stream) {
 				bridge(wrapped, backend)
 				return
 			}
-			fs, err := AcceptForward(ctx, granted, ftls, s.logger)
+			nonce, err := s.ArmForwardRegister(granted.MyAllocation)
+			if err != nil {
+				s.logger.Warn("agent: arm ForwardRegister failed; tearing down stream",
+					"stream_id", in.StreamId, "err", err)
+				bridge(wrapped, backend)
+				return
+			}
+			fs, err := AcceptForward(ctx, granted, ftls, nonce, s.logger)
 			if err != nil {
 				s.logger.Warn("agent: forward accept failed; tearing down stream",
 					"stream_id", in.StreamId, "err", err)

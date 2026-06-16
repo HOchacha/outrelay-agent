@@ -345,17 +345,20 @@ func (r *ResumableForwardStream) PrepareResume(ctx context.Context, granted *orp
 		_ = oldFS.Close()
 	}
 
-	// Rebuild based on role. Both calls produce a fresh ForwardSession
-	// with a fresh e2e QUIC connection + first stream.
-	var (
-		newFS *ForwardSession
-		err   error
-	)
+	// Arm the relay's pending entry for our new alloc, then rebuild
+	// the tunnel. Same nonce flows on both the control plane (here)
+	// and the data plane (forward.Dial inside DialForward / AcceptForward);
+	// the relay only binds the UDP src after both halves agree.
+	nonce, err := r.owner.ArmForwardRegister(granted.MyAllocation)
+	if err != nil {
+		return fmt.Errorf("session: arm forward register on resume: %w", err)
+	}
+	var newFS *ForwardSession
 	switch r.role {
 	case ForwardRoleInitiator:
-		newFS, err = DialForward(ctx, granted, r.peerTLS, r.logger)
+		newFS, err = DialForward(ctx, granted, r.peerTLS, nonce, r.logger)
 	case ForwardRoleResponder:
-		newFS, err = AcceptForward(ctx, granted, r.peerTLS, r.logger)
+		newFS, err = AcceptForward(ctx, granted, r.peerTLS, nonce, r.logger)
 	default:
 		return fmt.Errorf("session: unknown forward role %v", r.role)
 	}

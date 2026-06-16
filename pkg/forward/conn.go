@@ -13,9 +13,12 @@
 // quic-go's connection map sees a stable remote per connection.
 //
 // Bootstrap: Dial sends a registration packet (peer_alloc=0,
-// payload=[my_alloc]) so the relay records (my_alloc -> our UDP
-// src). After registration the conn is ready for quic.Transport
-// to layer end-to-end QUIC on top.
+// payload=[my_alloc][punch_nonce]) so the relay records
+// (my_alloc -> our UDP src). The nonce must match what the agent
+// also sent on the control plane via FrameTypeForwardRegister —
+// the relay's pending entry binds the two halves together and
+// rejects a punch whose nonce doesn't match. After registration
+// the conn is ready for quic.Transport to layer end-to-end QUIC.
 
 package forward
 
@@ -41,15 +44,21 @@ import (
 // relay's allocation has been wiped (e.g., relay restart).
 const DefaultIdleTimeout = 20 * time.Second
 
+// PunchNonceSize is the byte length of the random nonce embedded in
+// both the control-plane FrameTypeForwardRegister and the UDP punch.
+// Keep in sync with relay's forward.PunchNonceSize.
+const PunchNonceSize = 16
+
 // Conn satisfies net.PacketConn. quic.Transport uses it as its
 // underlying socket.
 type Conn struct {
-	udp       *net.UDPConn
-	relay     netip.AddrPort
-	relayAddr net.Addr // pre-computed for ReadFrom's return
-	peerAlloc uint32
-	myAlloc   uint32
-	logger    *slog.Logger
+	udp        *net.UDPConn
+	relay      netip.AddrPort
+	relayAddr  net.Addr // pre-computed for ReadFrom's return
+	peerAlloc  uint32
+	myAlloc    uint32
+	punchNonce [PunchNonceSize]byte
+	logger     *slog.Logger
 
 	// lastInbound is the unix-nano timestamp of the most recent
 	// successful ReadFrom. WatchIdle reads this atomically to decide
@@ -61,13 +70,18 @@ type Conn struct {
 // forwarding plane at relayAddr, and returns a Conn keyed to send
 // to the peer's allocation. The Conn satisfies net.PacketConn for
 // quic.Transport.
-func Dial(relay netip.AddrPort, myAlloc, peerAlloc uint32) (*Conn, error) {
-	return DialWithLogger(relay, myAlloc, peerAlloc, nil)
+//
+// punchNonce is the 16-byte random the caller must have already sent
+// to the relay on the control plane via FrameTypeForwardRegister:
+// the relay binds (alloc -> our UDP src) only after the two halves
+// land and their nonces match.
+func Dial(relay netip.AddrPort, myAlloc, peerAlloc uint32, punchNonce [PunchNonceSize]byte) (*Conn, error) {
+	return DialWithLogger(relay, myAlloc, peerAlloc, punchNonce, nil)
 }
 
 // DialWithLogger is Dial with an explicit logger. A nil logger
 // disables logging.
-func DialWithLogger(relay netip.AddrPort, myAlloc, peerAlloc uint32, logger *slog.Logger) (*Conn, error) {
+func DialWithLogger(relay netip.AddrPort, myAlloc, peerAlloc uint32, punchNonce [PunchNonceSize]byte, logger *slog.Logger) (*Conn, error) {
 	if myAlloc == 0 || peerAlloc == 0 {
 		return nil, errors.New("forward: alloc ids must be non-zero")
 	}
@@ -80,12 +94,13 @@ func DialWithLogger(relay netip.AddrPort, myAlloc, peerAlloc uint32, logger *slo
 		return nil, fmt.Errorf("forward: bind local UDP: %w", err)
 	}
 	c := &Conn{
-		udp:       udp,
-		relay:     relay,
-		relayAddr: net.UDPAddrFromAddrPort(relay),
-		peerAlloc: peerAlloc,
-		myAlloc:   myAlloc,
-		logger:    logger,
+		udp:        udp,
+		relay:      relay,
+		relayAddr:  net.UDPAddrFromAddrPort(relay),
+		peerAlloc:  peerAlloc,
+		myAlloc:    myAlloc,
+		punchNonce: punchNonce,
+		logger:     logger,
 	}
 	if err := c.register(); err != nil {
 		_ = udp.Close()
@@ -95,9 +110,10 @@ func DialWithLogger(relay netip.AddrPort, myAlloc, peerAlloc uint32, logger *slo
 }
 
 func (c *Conn) register() error {
-	buf := make([]byte, 8)
+	buf := make([]byte, 8+PunchNonceSize)
 	binary.BigEndian.PutUint32(buf[0:4], 0) // peer_alloc=0 = registration
 	binary.BigEndian.PutUint32(buf[4:8], c.myAlloc)
+	copy(buf[8:], c.punchNonce[:])
 	if _, err := c.udp.WriteToUDPAddrPort(buf, c.relay); err != nil {
 		c.logger.Warn("forward: register failed",
 			"relay", c.relay.String(), "my_alloc", c.myAlloc, "err", err)

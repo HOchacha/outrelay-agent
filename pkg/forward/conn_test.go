@@ -51,16 +51,31 @@ func TestQUICOverForward(t *testing.T) {
 	relay := plane.Endpoint()
 
 	// Two allocations: A (dialer), B (listener).
-	allocA := plane.Allocate()
-	allocB := plane.Allocate()
+	uriA := "outrelay://acme/agent/aaa"
+	uriB := "outrelay://acme/agent/bbb"
+	allocA := plane.Allocate(uriA)
+	allocB := plane.Allocate(uriB)
+
+	// Arm pending entries with the nonces each agent will embed in
+	// its UDP punch — the relay binds (alloc -> src) only after the
+	// control-plane ArmPending and the data-plane punch agree.
+	var nonceA, nonceB [agentforward.PunchNonceSize]byte
+	nonceA[0] = 0xAA
+	nonceB[0] = 0xBB
+	if err := plane.ArmPending(allocA, uriA, nonceA); err != nil {
+		t.Fatalf("ArmPending A: %v", err)
+	}
+	if err := plane.ArmPending(allocB, uriB, nonceB); err != nil {
+		t.Fatalf("ArmPending B: %v", err)
+	}
 
 	// Each agent's Conn registers with the plane on Dial.
-	connA, err := agentforward.Dial(relay, allocA, allocB)
+	connA, err := agentforward.Dial(relay, allocA, allocB, nonceA)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer connA.Close()
-	connB, err := agentforward.Dial(relay, allocB, allocA)
+	connB, err := agentforward.Dial(relay, allocB, allocA, nonceB)
 	if err != nil {
 		t.Fatal(err)
 	}
